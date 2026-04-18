@@ -114,8 +114,8 @@ pub fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template via the embeddedin API.",
-    version="0.1.0",
+    about="List pages that transclude a MediaWiki template via the embeddedin API.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    version="0.1.2",
     arg_required_else_help=true,
     flags=[
       @argparse.FlagArg::new(
@@ -835,8 +835,15 @@ fn temporary_output_path() -> String {
 }
 
 ///|
+#cfg(not(platform="windows"))
 fn shell_quote(value : String) -> String {
   "'" + value.replace(old="'", new="'\"'\"'") + "'"
+}
+
+///|
+#cfg(platform="windows")
+fn shell_quote(value : String) -> String {
+  "\"" + value.replace(old="\"", new="\"\"").replace(old="%", new="%%") + "\""
 }
 
 ///|

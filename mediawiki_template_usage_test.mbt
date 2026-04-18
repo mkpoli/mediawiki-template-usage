@@ -68,4 +68,9 @@ test "render help mentions limit and template" {
   assert_true(help.contains("--show-content"))
   assert_true(help.contains("template"))
   assert_true(help.contains("embeddedin API"))
+  assert_true(help.contains("Examples:"))
+  assert_true(
+    help.contains("./mediawiki-template-usage enwp \"Citation needed\""),
+  )
+  assert_true(help.contains("moon run cmd/main -- enwp \"Citation needed\""))
 }
