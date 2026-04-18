@@ -104,7 +104,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
 ///|
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
-    "wikipedia-template-usage",
+    "mediawiki-template-usage",
     about="List pages that transclude a MediaWiki template via the embeddedin API.",
     version="0.1.0",
     arg_required_else_help=true,
@@ -455,7 +455,7 @@ fn build_curl_command(
 ) -> String {
   let mut command = "curl --silent --show-error --fail --get"
   command += " --user-agent " +
-    shell_quote("wikipedia-template-usage/0.1 (local MoonBit CLI)")
+    shell_quote("mediawiki-template-usage/0.1 (local MoonBit CLI)")
   command += " --data-urlencode " + shell_quote("action=query")
   command += " --data-urlencode " + shell_quote("format=json")
   command += " --data-urlencode " + shell_quote("list=embeddedin")
@@ -537,7 +537,7 @@ fn normalize_template_name(template_name : String) -> String {
 ///|
 fn temporary_output_path() -> String {
   let cwd = @env.current_dir().unwrap_or(".")
-  cwd + "/.wikipedia_template_usage_" + @env.now().to_string() + ".json"
+  cwd + "/.mediawiki_template_usage_" + @env.now().to_string() + ".json"
 }
 
 ///|

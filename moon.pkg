@@ -8,9 +8,9 @@ import {
 
 options(
   targets: {
-    "wikipedia_template_usage.mbt": [ "native", "llvm" ],
-    "wikipedia_template_usage_stub.mbt": [ "not", "native", "llvm" ],
-    "wikipedia_template_usage_test.mbt": [ "native", "llvm" ],
-    "wikipedia_template_usage_wbtest.mbt": [ "native", "llvm" ],
+    "mediawiki_template_usage.mbt": [ "native", "llvm" ],
+    "mediawiki_template_usage_stub.mbt": [ "not", "native", "llvm" ],
+    "mediawiki_template_usage_test.mbt": [ "native", "llvm" ],
+    "mediawiki_template_usage_wbtest.mbt": [ "native", "llvm" ],
   },
 )

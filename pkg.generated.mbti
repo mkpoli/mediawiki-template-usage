@@ -1,5 +1,5 @@
 // Generated using `moon info`, DON'T EDIT IT
-package "username/wikipedia_template_usage"
+package "username/mediawiki_template_usage"
 
 import {
   "moonbitlang/core/argparse",

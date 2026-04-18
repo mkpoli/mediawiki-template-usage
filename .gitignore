@@ -2,4 +2,4 @@
 _build/
 .mooncakes/
 .moonagent/
-.wikipedia_template_usage_*.json
+.mediawiki_template_usage_*.json

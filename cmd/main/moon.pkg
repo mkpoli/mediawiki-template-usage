@@ -1,6 +1,6 @@
 import {
   "moonbitlang/core/env",
-  "username/wikipedia_template_usage" @app,
+  "username/mediawiki_template_usage" @app,
 }
 
 options(
