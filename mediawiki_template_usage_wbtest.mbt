@@ -93,9 +93,25 @@ test "extract page content response" {
 }
 
 ///|
+test "extract template usages finds matching snippets" {
+  let content = "Before\n{{Infobox scientist|name=Albert Einstein}}\nMiddle\n{{Citation needed|date=April 2024}}\nAfter"
+  assert_eq(extract_template_usages(content, "Citation needed"), [
+    "{{Citation needed|date=April 2024}}",
+  ])
+}
+
+///|
+test "extract template usages handles nested templates" {
+  let content = "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}"
+  assert_eq(extract_template_usages(content, "Template:Citation needed"), [
+    "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}",
+  ])
+}
+
+///|
 test "render page content prefixes title" {
   assert_eq(
-    render_page_content("Albert Einstein", "{{Infobox scientist}}\nBody"),
-    "=== Albert Einstein ===\n{{Infobox scientist}}\nBody",
+    render_page_content("Albert Einstein", ["{{Infobox scientist}}"]),
+    "= Albert Einstein =\n{{Infobox scientist}}",
   )
 }

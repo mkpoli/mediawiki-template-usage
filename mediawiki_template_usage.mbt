@@ -96,7 +96,13 @@ pub fn run_cli(args : Array[String]) -> Unit {
         config.sort_by,
         config.limit,
       ) {
-      Ok(titles) => output_results(config.endpoint, titles, config.show_content)
+      Ok(titles) =>
+        output_results(
+          config.endpoint,
+          config.template_name,
+          titles,
+          config.show_content,
+        )
       Err(message) => println("error: \{message}")
     }
   } catch {
@@ -114,7 +120,7 @@ pub fn command() -> @argparse.Command {
     flags=[
       @argparse.FlagArg::new(
         "show-content",
-        about="Fetch and print full page content for the final results. Best used with --limit.",
+        about="Fetch and print only matching template usages for the final results. Best used with --limit.",
       ),
     ],
     options=[
@@ -174,6 +180,7 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
 ///|
 fn output_results(
   endpoint : String,
+  template_name : String,
   titles : Array[String],
   show_content : Bool,
 ) -> Unit {
@@ -184,7 +191,7 @@ fn output_results(
     return
   }
   match fetch_page_contents(endpoint, titles) {
-    Ok(contents) => print_page_contents(titles, contents)
+    Ok(contents) => print_page_contents(titles, template_name, contents)
     Err(message) => println("error: \{message}")
   }
 }
@@ -589,21 +596,128 @@ fn extract_page_revision_content(page_obj : Map[String, Json]) -> String {
 ///|
 fn print_page_contents(
   titles : Array[String],
+  template_name : String,
   contents : Map[String, String],
 ) -> Unit {
   let mut first = true
   for title in titles {
+    let snippets = extract_template_usages(
+      contents.get_or_default(title, ""),
+      template_name,
+    )
+    if snippets.length() == 0 {
+      continue
+    }
     if !first {
       println("")
     }
     first = false
-    println(render_page_content(title, contents.get_or_default(title, "")))
+    println(render_page_content(title, snippets))
   }
 }
 
 ///|
-fn render_page_content(title : String, content : String) -> String {
-  "=== " + title + " ===\n" + content
+fn render_page_content(title : String, snippets : Array[String]) -> String {
+  "= " + title + " =\n" + snippets.join("\n\n")
+}
+
+///|
+fn extract_template_usages(
+  content : String,
+  template_name : String,
+) -> Array[String] {
+  let snippets = []
+  let normalized_template = normalize_template_target(template_name)
+  let len = content.length()
+  let mut i = 0
+  while i + 1 < len {
+    if is_double_open_brace(content, i) {
+      let end = find_transclusion_end(content, i)
+      if end > i {
+        let snippet = content[i:end].to_string()
+        if normalize_template_target(extract_transclusion_target(snippet)) ==
+          normalized_template {
+          snippets.push(snippet)
+        }
+        i = end
+        continue
+      }
+    }
+    i += 1
+  }
+  snippets
+}
+
+///|
+fn extract_transclusion_target(snippet : String) -> String {
+  if snippet.length() < 4 {
+    return ""
+  }
+  let body = snippet[2:snippet.length() - 2].to_string().trim().to_string()
+  let head = body.split("|").to_array()[0].trim().to_string()
+  strip_transclusion_prefixes(head)
+}
+
+///|
+fn strip_transclusion_prefixes(target : String) -> String {
+  let normalized = target.trim().to_string()
+  let lowered = normalized.to_lower()
+  if lowered.has_prefix("subst:") {
+    return strip_transclusion_prefixes(normalized[6:].to_string())
+  }
+  if lowered.has_prefix("safesubst:") {
+    return strip_transclusion_prefixes(normalized[10:].to_string())
+  }
+  normalized
+}
+
+///|
+fn normalize_template_target(template_name : String) -> String {
+  let normalized = strip_transclusion_prefixes(
+    template_name.replace(old="_", new=" ").trim().to_string(),
+  )
+  let lowered = normalized.to_lower()
+  if lowered.has_prefix("template:") {
+    lowered[9:].trim().to_string()
+  } else {
+    lowered
+  }
+}
+
+///|
+fn find_transclusion_end(content : String, start : Int) -> Int {
+  let len = content.length()
+  let mut depth = 0
+  let mut i = start
+  while i + 1 < len {
+    if is_double_open_brace(content, i) {
+      depth += 1
+      i += 2
+      continue
+    }
+    if is_double_close_brace(content, i) {
+      depth -= 1
+      i += 2
+      if depth == 0 {
+        return i
+      }
+      continue
+    }
+    i += 1
+  }
+  -1
+}
+
+///|
+fn is_double_open_brace(content : String, index : Int) -> Bool {
+  content.code_unit_at(index).to_int() == 123 &&
+  content.code_unit_at(index + 1).to_int() == 123
+}
+
+///|
+fn is_double_close_brace(content : String, index : Int) -> Bool {
+  content.code_unit_at(index).to_int() == 125 &&
+  content.code_unit_at(index + 1).to_int() == 125
 }
 
 ///|
