@@ -1,10 +1,11 @@
 {
   "name": "username/mediawiki_template_usage",
-  "version": "0.1.0",
-  "preferred-target": "native",
+  "version": "0.1.1",
   "readme": "README.mbt.md",
   "repository": "",
   "license": "Apache-2.0",
   "keywords": [],
-  "description": "CLI for listing MediaWiki pages that use a template via the embeddedin API"
+  "description": "CLI for listing MediaWiki pages that use a template via the embeddedin API",
+  "preferred-target": "native",
+  "supported-targets": "native"
 }

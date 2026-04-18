@@ -8,7 +8,7 @@ By default, the tool returns up to 10 matching pages.
 
 ## Release
 
-GitHub Actions now builds and tests the project on pushes and pull requests.
+GitHub Actions now builds and tests the project on Linux, macOS, and Windows.
 
 Pushing a version tag such as `v0.1.0` triggers the release workflow, which:
 
@@ -19,7 +19,11 @@ git push origin v0.1.0
 
 - compiles the native CLI in release mode
 - packages the binary together with `README.md` and `LICENSE`
-- uploads the `.tar.gz` archive and its `.sha256` file to the GitHub Release
+- uploads platform-specific archives and `.sha256` files to the GitHub Release
+
+The release archives let users run the CLI without installing MoonBit first.
+
+Current limitation: the CLI still shells out to `curl`, so release binaries still require `curl` to be available on the target system.
 
 ## Usage
 
