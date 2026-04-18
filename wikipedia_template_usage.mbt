@@ -1,0 +1,655 @@
+///|
+const SEEK_SET = 0
+
+///|
+const SEEK_END = 2
+
+///|
+const O_RDONLY = 0
+
+///|
+pub(all) enum SortBy {
+  Api
+  TitleAsc
+  TitleDesc
+} derive(Eq)
+
+///|
+pub impl Show for SortBy with output(self, logger) {
+  let label = match self {
+    Api => "api"
+    TitleAsc => "title-asc"
+    TitleDesc => "title-desc"
+  }
+  logger.write_string(label)
+}
+
+///|
+pub(all) struct Config {
+  endpoint : String
+  template_name : String
+  limit : Int?
+  sort_by : SortBy
+} derive(Eq)
+
+///|
+pub impl Show for Config with output(self, logger) {
+  logger.write_string("Config::{ endpoint: ")
+  logger.write_object(self.endpoint)
+  logger.write_string(", template_name: ")
+  logger.write_object(self.template_name)
+  logger.write_string(", limit: ")
+  logger.write_object(self.limit)
+  logger.write_string(", sort_by: ")
+  logger.write_object(self.sort_by)
+  logger.write_string(" }")
+}
+
+///|
+pub(all) suberror CliError {
+  Message(String)
+}
+
+///|
+pub impl Show for CliError with output(self, logger) {
+  match self {
+    Message(message) => logger.write_string(message)
+  }
+}
+
+///|
+#borrow(raw)
+extern "c" fn system_ffi(raw : Bytes) -> Int = "system"
+
+///|
+#borrow(path)
+extern "c" fn open_ffi(path : Bytes, flags : Int, mode : Int) -> Int = "open"
+
+///|
+#borrow(buffer)
+extern "c" fn read_ffi(fd : Int, buffer : Bytes, size : Int) -> Int = "read"
+
+///|
+extern "c" fn close_ffi(fd : Int) -> Int = "close"
+
+///|
+extern "c" fn lseek_ffi(fd : Int, offset : Int, whence : Int) -> Int = "lseek"
+
+///|
+#borrow(path)
+extern "c" fn unlink_ffi(path : Bytes) -> Int = "unlink"
+
+///|
+pub fn run_cli(args : Array[String]) -> Unit {
+  try {
+    let config = parse_config(args)
+    match
+      fetch_all_template_usages(
+        config.endpoint,
+        config.template_name,
+        config.sort_by,
+        config.limit,
+      ) {
+      Ok(titles) =>
+        for title in titles {
+          println(title)
+        }
+      Err(message) => println("error: \{message}")
+    }
+  } catch {
+    err => println(err.to_string())
+  }
+}
+
+///|
+pub fn command() -> @argparse.Command {
+  @argparse.Command::new(
+    "wikipedia-template-usage",
+    about="List pages that transclude a MediaWiki template via the embeddedin API.",
+    version="0.1.0",
+    arg_required_else_help=true,
+    options=[
+      @argparse.OptionArg::new(
+        "limit",
+        short='l',
+        about="Maximum number of page titles to print.",
+      ),
+      @argparse.OptionArg::new(
+        "sort-by",
+        short='s',
+        about="Sort order: api, title-asc, or title-desc.",
+        default_values=["api"],
+      ),
+    ],
+    positionals=[
+      @argparse.PositionArg::new(
+        "endpoint",
+        about="MediaWiki API endpoint or alias, for example https://en.wikipedia.org/w/api.php, enwp, commons, or wikidata",
+        num_args=@argparse.ValueRange::single(),
+      ),
+      @argparse.PositionArg::new(
+        "template",
+        about="Template name, with or without the Template: prefix",
+        num_args=@argparse.ValueRange::single(),
+      ),
+    ],
+  )
+}
+
+///|
+pub fn parse_config(args : Array[String]) -> Config raise CliError {
+  let matches = command().parse(argv=extract_cli_args(args)) catch {
+    err => raise Message(err.to_string())
+  }
+  let values = matches.values
+  guard values.get("endpoint") is Some([raw_endpoint, ..]) else {
+    raise Message("missing endpoint argument")
+  }
+  guard values.get("template") is Some([template_name, ..]) else {
+    raise Message("missing template argument")
+  }
+  let endpoint = resolve_endpoint(raw_endpoint)
+  let limit = match values.get("limit") {
+    Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
+    _ => None
+  }
+  let sort_by = match values.get("sort-by") {
+    Some([raw_sort, ..]) => parse_sort_by(raw_sort)
+    _ => Api
+  }
+  { endpoint, template_name, limit, sort_by }
+}
+
+///|
+fn resolve_endpoint(raw_endpoint : String) -> String raise CliError {
+  let endpoint = raw_endpoint.trim().to_string()
+  if endpoint.contains("://") {
+    return endpoint
+  }
+  match endpoint {
+    "commons" => "https://commons.wikimedia.org/w/api.php"
+    "meta" => "https://meta.wikimedia.org/w/api.php"
+    "mediawiki" | "mw" => "https://www.mediawiki.org/w/api.php"
+    "wikidata" | "wd" => "https://www.wikidata.org/w/api.php"
+    _ => resolve_language_project_alias(endpoint)
+  }
+}
+
+///|
+fn resolve_language_project_alias(shorthand : String) -> String raise CliError {
+  if shorthand.length() > 2 && shorthand.has_suffix("wp") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikipedia",
+    )
+  }
+  if shorthand.length() > 4 && shorthand.has_suffix("wikt") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 4],
+      "wiktionary",
+    )
+  }
+  if shorthand.length() > 2 && shorthand.has_suffix("wb") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikibooks",
+    )
+  }
+  if shorthand.length() > 2 && shorthand.has_suffix("wn") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikinews",
+    )
+  }
+  if shorthand.length() > 2 && shorthand.has_suffix("wq") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikiquote",
+    )
+  }
+  if shorthand.length() > 2 && shorthand.has_suffix("ws") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikisource",
+    )
+  }
+  if shorthand.length() > 2 && shorthand.has_suffix("wv") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 2],
+      "wikiversity",
+    )
+  }
+  if shorthand.length() > 3 && shorthand.has_suffix("voy") {
+    return build_language_project_endpoint(
+      shorthand[:shorthand.length() - 3],
+      "wikivoyage",
+    )
+  }
+  raise Message(
+    "unknown endpoint alias '\{shorthand}'. Use a full https://.../w/api.php endpoint or a known alias like enwp, commons, meta, mediawiki, or wikidata",
+  )
+}
+
+///|
+fn build_language_project_endpoint(
+  lang : StringView,
+  project : String,
+) -> String {
+  "https://" + lang.to_string() + "." + project + ".org/w/api.php"
+}
+
+///|
+fn parse_limit(raw_limit : String) -> Int raise CliError {
+  let parsed : Result[Int, _] = try? @string.parse_int(raw_limit)
+  match parsed {
+    Ok(limit) => {
+      if limit <= 0 {
+        raise Message("limit must be greater than 0")
+      }
+      limit
+    }
+    Err(_) => raise Message("limit must be a positive integer")
+  }
+}
+
+///|
+fn parse_sort_by(raw_sort : String) -> SortBy raise CliError {
+  match raw_sort.trim() {
+    "api" => Api
+    "title-asc" => TitleAsc
+    "title-desc" => TitleDesc
+    _ => raise Message("sort-by must be one of: api, title-asc, title-desc")
+  }
+}
+
+///|
+fn extract_cli_args(args : Array[String]) -> Array[String] {
+  let mut separator_index = -1
+  for i = 0; i < args.length(); i = i + 1 {
+    if args[i] == "--" {
+      separator_index = i
+    }
+  }
+  if separator_index >= 0 {
+    copy_args_from(args, separator_index + 1)
+  } else if args.length() > 0 {
+    copy_args_from(args, 1)
+  } else {
+    []
+  }
+}
+
+///|
+fn copy_args_from(args : Array[String], start : Int) -> Array[String] {
+  let copied = []
+  for i = start; i < args.length(); i = i + 1 {
+    copied.push(args[i])
+  }
+  copied
+}
+
+///|
+fn fetch_all_template_usages(
+  endpoint : String,
+  template_name : String,
+  sort_by : SortBy,
+  limit : Int?,
+) -> Result[Array[String], String] {
+  let titles = match
+    fetch_all_template_usage_titles(
+      endpoint,
+      normalize_template_name(template_name),
+      None,
+      [],
+    ) {
+    Ok(titles) => titles
+    Err(message) => return Err(message)
+  }
+  Ok(limit_titles(sort_titles(titles, sort_by), limit))
+}
+
+///|
+fn fetch_all_template_usage_titles(
+  endpoint : String,
+  template_title : String,
+  continue_token : String?,
+  acc : Array[String],
+) -> Result[Array[String], String] {
+  let payload = match
+    fetch_embeddedin_page(endpoint, template_title, continue_token) {
+    Ok(payload) => payload
+    Err(message) => return Err(message)
+  }
+  let (titles, next_token) = match parse_embeddedin_payload(payload) {
+    Ok(result) => result
+    Err(message) => return Err(message)
+  }
+  for title in titles {
+    acc.push(title)
+  }
+  match next_token {
+    Some(token) =>
+      fetch_all_template_usage_titles(
+        endpoint,
+        template_title,
+        Some(token),
+        acc,
+      )
+    None => Ok(acc)
+  }
+}
+
+///|
+fn sort_titles(titles : Array[String], sort_by : SortBy) -> Array[String] {
+  if sort_by is Api {
+    return titles.copy()
+  }
+  if titles.length() <= 1 {
+    return titles.copy()
+  }
+  let pivot = titles[titles.length() / 2]
+  let less = []
+  let equal = []
+  let greater = []
+  for title in titles {
+    let order = compare_titles_for_sort(title, pivot, sort_by)
+    if order < 0 {
+      less.push(title)
+    } else if order > 0 {
+      greater.push(title)
+    } else {
+      equal.push(title)
+    }
+  }
+  concat_titles(
+    sort_titles(less, sort_by),
+    equal,
+    sort_titles(greater, sort_by),
+  )
+}
+
+///|
+fn concat_titles(
+  left : Array[String],
+  middle : Array[String],
+  right : Array[String],
+) -> Array[String] {
+  let merged = []
+  append_titles(merged, left)
+  append_titles(merged, middle)
+  append_titles(merged, right)
+  merged
+}
+
+///|
+fn append_titles(target : Array[String], source : Array[String]) -> Unit {
+  for title in source {
+    target.push(title)
+  }
+}
+
+///|
+fn compare_titles_for_sort(
+  left : String,
+  right : String,
+  sort_by : SortBy,
+) -> Int {
+  match sort_by {
+    Api => 0
+    TitleAsc => compare_titles(left, right)
+    TitleDesc => compare_titles(right, left)
+  }
+}
+
+///|
+fn compare_titles(left : String, right : String) -> Int {
+  left.lexical_compare(right)
+}
+
+///|
+fn limit_titles(titles : Array[String], limit : Int?) -> Array[String] {
+  match limit {
+    None => titles.copy()
+    Some(limit) => {
+      let limited = []
+      if limit <= 0 {
+        return limited
+      }
+      for title in titles {
+        if limited.length() >= limit {
+          break
+        }
+        limited.push(title)
+      }
+      limited
+    }
+  }
+}
+
+///|
+fn fetch_embeddedin_page(
+  endpoint : String,
+  template_title : String,
+  continue_token : String?,
+) -> Result[String, String] {
+  let temp_path = temporary_output_path()
+  let command = build_curl_command(
+    endpoint, template_title, continue_token, temp_path,
+  )
+  let status = run_shell_command(command)
+  if status != 0 {
+    ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+    return Err("curl request failed")
+  }
+  let contents = read_file_to_string(temp_path)
+  ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+  contents
+}
+
+///|
+fn build_curl_command(
+  endpoint : String,
+  template_title : String,
+  continue_token : String?,
+  temp_path : String,
+) -> String {
+  let mut command = "curl --silent --show-error --fail --get"
+  command += " --user-agent " +
+    shell_quote("wikipedia-template-usage/0.1 (local MoonBit CLI)")
+  command += " --data-urlencode " + shell_quote("action=query")
+  command += " --data-urlencode " + shell_quote("format=json")
+  command += " --data-urlencode " + shell_quote("list=embeddedin")
+  command += " --data-urlencode " + shell_quote("eilimit=max")
+  command += " --data-urlencode " + shell_quote("continue=")
+  command += " --data-urlencode " + shell_quote("eititle=" + template_title)
+  match continue_token {
+    Some(token) =>
+      command += " --data-urlencode " + shell_quote("eicontinue=" + token)
+    None => ()
+  }
+  command += " " + shell_quote(endpoint)
+  command += " > " + shell_quote(temp_path)
+  command
+}
+
+///|
+fn parse_embeddedin_payload(
+  payload : String,
+) -> Result[(Array[String], String?), String] {
+  let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
+  match parsed {
+    Err(error) => Err("invalid JSON response: \{error.to_string()}")
+    Ok(json) => extract_embeddedin_response(json)
+  }
+}
+
+///|
+fn extract_embeddedin_response(
+  json : Json,
+) -> Result[(Array[String], String?), String] {
+  guard json is Json::Object(root) else {
+    return Err("response root is not an object")
+  }
+
+  let titles = []
+  match root.get("query") {
+    Some(Json::Object(query)) =>
+      match query.get("embeddedin") {
+        Some(Json::Array(pages)) =>
+          for page in pages {
+            guard page is Json::Object(page_obj) else { continue }
+            guard page_obj.get("title") is Some(Json::String(title)) else {
+              continue
+            }
+            titles.push(title)
+          }
+        Some(_) => return Err("query.embeddedin is not an array")
+        None => ()
+      }
+    Some(_) => return Err("query is not an object")
+    None => ()
+  }
+
+  let next_token = match root.get("continue") {
+    Some(Json::Object(cont)) =>
+      match cont.get("eicontinue") {
+        Some(Json::String(token)) => Some(token)
+        Some(_) => return Err("continue.eicontinue is not a string")
+        None => None
+      }
+    Some(_) => return Err("continue is not an object")
+    None => None
+  }
+
+  Ok((titles, next_token))
+}
+
+///|
+fn normalize_template_name(template_name : String) -> String {
+  let trimmed = template_name.trim().to_string()
+  if trimmed.has_prefix("Template:") {
+    trimmed
+  } else {
+    "Template:" + trimmed
+  }
+}
+
+///|
+fn temporary_output_path() -> String {
+  let cwd = @env.current_dir().unwrap_or(".")
+  cwd + "/.wikipedia_template_usage_" + @env.now().to_string() + ".json"
+}
+
+///|
+fn shell_quote(value : String) -> String {
+  "'" + value.replace(old="'", new="'\"'\"'") + "'"
+}
+
+///|
+fn run_shell_command(command : String) -> Int {
+  system_ffi(string_to_utf8_bytes(command, true))
+}
+
+///|
+fn read_file_to_string(path : String) -> Result[String, String] {
+  let path_bytes = string_to_utf8_bytes(path, true)
+  let fd = open_ffi(path_bytes, O_RDONLY, 0)
+  if fd < 0 {
+    return Err("failed to open response file")
+  }
+  let size = lseek_ffi(fd, 0, SEEK_END)
+  if size < 0 {
+    ignore(close_ffi(fd))
+    return Err("failed to stat response file")
+  }
+  ignore(lseek_ffi(fd, 0, SEEK_SET))
+  let buffer = Bytes::new(size)
+  let read = read_ffi(fd, buffer, size)
+  if read < 0 {
+    ignore(close_ffi(fd))
+    return Err("failed to read response file")
+  }
+  ignore(close_ffi(fd))
+  Ok(utf8_bytes_to_string(buffer[:read].to_bytes()))
+}
+
+///|
+fn string_to_utf8_bytes(str : String, append_nul : Bool) -> Bytes {
+  let res : Array[Byte] = []
+  let len = str.length()
+  let mut i = 0
+  while i < len {
+    let mut c = str.code_unit_at(i).to_int()
+    if 0xD800 <= c && c <= 0xDBFF {
+      c -= 0xD800
+      i += 1
+      let low = str.code_unit_at(i).to_int() - 0xDC00
+      c = (c << 10) + low + 0x10000
+    }
+    if c < 0x80 {
+      res.push(c.to_byte())
+    } else if c < 0x800 {
+      res.push((0xC0 + (c >> 6)).to_byte())
+      res.push((0x80 + (c & 0x3F)).to_byte())
+    } else if c < 0x10000 {
+      res.push((0xE0 + (c >> 12)).to_byte())
+      res.push((0x80 + ((c >> 6) & 0x3F)).to_byte())
+      res.push((0x80 + (c & 0x3F)).to_byte())
+    } else {
+      res.push((0xF0 + (c >> 18)).to_byte())
+      res.push((0x80 + ((c >> 12) & 0x3F)).to_byte())
+      res.push((0x80 + ((c >> 6) & 0x3F)).to_byte())
+      res.push((0x80 + (c & 0x3F)).to_byte())
+    }
+    i += 1
+  }
+  if append_nul {
+    res.push(0)
+  }
+  Bytes::from_array(res)
+}
+
+///|
+fn utf8_bytes_to_string(bytes : Bytes) -> String {
+  let res = StringBuilder::new()
+  let len = bytes.length()
+  let mut i = 0
+  while i < len {
+    let mut c = bytes[i].to_int()
+    if c == 0 {
+      break
+    } else if c < 0x80 {
+      res.write_char(c.unsafe_to_char())
+      i += 1
+    } else if c < 0xE0 {
+      if i + 1 >= len {
+        break
+      }
+      c = ((c & 0x1F) << 6) | (bytes[i + 1].to_int() & 0x3F)
+      res.write_char(c.unsafe_to_char())
+      i += 2
+    } else if c < 0xF0 {
+      if i + 2 >= len {
+        break
+      }
+      c = ((c & 0x0F) << 12) |
+        ((bytes[i + 1].to_int() & 0x3F) << 6) |
+        (bytes[i + 2].to_int() & 0x3F)
+      res.write_char(c.unsafe_to_char())
+      i += 3
+    } else {
+      if i + 3 >= len {
+        break
+      }
+      c = ((c & 0x07) << 18) |
+        ((bytes[i + 1].to_int() & 0x3F) << 12) |
+        ((bytes[i + 2].to_int() & 0x3F) << 6) |
+        (bytes[i + 3].to_int() & 0x3F)
+      c -= 0x10000
+      res.write_char(((c >> 10) + 0xD800).unsafe_to_char())
+      res.write_char(((c & 0x3FF) + 0xDC00).unsafe_to_char())
+      i += 4
+    }
+  }
+  res.to_string()
+}

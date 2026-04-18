@@ -1,0 +1,40 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "username/wikipedia_template_usage"
+
+import {
+  "moonbitlang/core/argparse",
+}
+
+// Values
+pub fn command() -> @argparse.Command
+
+pub fn parse_config(Array[String]) -> Config raise CliError
+
+pub fn run_cli(Array[String]) -> Unit
+
+// Errors
+pub(all) suberror CliError {
+  Message(String)
+}
+pub impl Show for CliError
+
+// Types and methods
+pub(all) struct Config {
+  endpoint : String
+  template_name : String
+  limit : Int?
+  sort_by : SortBy
+} derive(Eq)
+pub impl Show for Config
+
+pub(all) enum SortBy {
+  Api
+  TitleAsc
+  TitleDesc
+} derive(Eq)
+pub impl Show for SortBy
+
+// Type aliases
+
+// Traits
+

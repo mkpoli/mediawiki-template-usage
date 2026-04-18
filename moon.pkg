@@ -1,0 +1,16 @@
+import {
+  "moonbitlang/core/argparse",
+  "moonbitlang/core/builtin",
+  "moonbitlang/core/env",
+  "moonbitlang/core/json",
+  "moonbitlang/core/string",
+}
+
+options(
+  targets: {
+    "wikipedia_template_usage.mbt": [ "native", "llvm" ],
+    "wikipedia_template_usage_stub.mbt": [ "not", "native", "llvm" ],
+    "wikipedia_template_usage_test.mbt": [ "native", "llvm" ],
+    "wikipedia_template_usage_wbtest.mbt": [ "native", "llvm" ],
+  },
+)

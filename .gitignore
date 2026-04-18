@@ -1,0 +1,5 @@
+.DS_Store
+_build/
+.mooncakes/
+.moonagent/
+.wikipedia_template_usage_*.json
