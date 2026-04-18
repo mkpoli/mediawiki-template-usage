@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up MoonBit
+        run: |
+          curl -fsSL https://cli.moonbitlang.com/install/unix.sh | bash
+          echo "$HOME/.moon/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          moon version --all
+
+      - name: Refresh package metadata
+        run: |
+          moon info
+
+      - name: Format project
+        run: |
+          moon fmt
+
+      - name: Run tests
+        run: |
+          moon test --target native
+
+      - name: Build release binary
+        run: |
+          moon run --target native --release --build-only cmd/main
+
+      - name: Package release artifact
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME:-dev}"
+          ARTIFACT_BASENAME="mediawiki-template-usage-${TAG_NAME}-linux-x86_64"
+          mkdir -p dist/package
+          cp _build/native/release/build/cmd/main/main.exe "dist/package/mediawiki-template-usage"
+          cp README.md LICENSE dist/package/
+          tar -C dist/package -czf "dist/${ARTIFACT_BASENAME}.tar.gz" .
+          sha256sum "dist/${ARTIFACT_BASENAME}.tar.gz" > "dist/${ARTIFACT_BASENAME}.tar.gz.sha256"
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mediawiki-template-usage-release
+          path: dist/*
+
+      - name: Publish GitHub release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
