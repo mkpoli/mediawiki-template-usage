@@ -8,6 +8,9 @@ const SEEK_END = 2
 const O_RDONLY = 0
 
 ///|
+const CONTENT_BATCH_SIZE = 20
+
+///|
 pub(all) enum SortBy {
   Api
   TitleAsc
@@ -30,6 +33,7 @@ pub(all) struct Config {
   template_name : String
   limit : Int?
   sort_by : SortBy
+  show_content : Bool
 } derive(Eq)
 
 ///|
@@ -42,6 +46,8 @@ pub impl Show for Config with output(self, logger) {
   logger.write_object(self.limit)
   logger.write_string(", sort_by: ")
   logger.write_object(self.sort_by)
+  logger.write_string(", show_content: ")
+  logger.write_object(self.show_content)
   logger.write_string(" }")
 }
 
@@ -90,10 +96,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
         config.sort_by,
         config.limit,
       ) {
-      Ok(titles) =>
-        for title in titles {
-          println(title)
-        }
+      Ok(titles) => output_results(config.endpoint, titles, config.show_content)
       Err(message) => println("error: \{message}")
     }
   } catch {
@@ -108,11 +111,18 @@ pub fn command() -> @argparse.Command {
     about="List pages that transclude a MediaWiki template via the embeddedin API.",
     version="0.1.0",
     arg_required_else_help=true,
+    flags=[
+      @argparse.FlagArg::new(
+        "show-content",
+        about="Fetch and print full page content for the final results. Best used with --limit.",
+      ),
+    ],
     options=[
       @argparse.OptionArg::new(
         "limit",
         short='l',
         about="Maximum number of page titles to print.",
+        default_values=["10"],
       ),
       @argparse.OptionArg::new(
         "sort-by",
@@ -151,13 +161,32 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
   let endpoint = resolve_endpoint(raw_endpoint)
   let limit = match values.get("limit") {
     Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
-    _ => None
+    _ => Some(10)
   }
   let sort_by = match values.get("sort-by") {
     Some([raw_sort, ..]) => parse_sort_by(raw_sort)
     _ => Api
   }
-  { endpoint, template_name, limit, sort_by }
+  let show_content = matches.flags.get_or_default("show-content", false)
+  { endpoint, template_name, limit, sort_by, show_content }
+}
+
+///|
+fn output_results(
+  endpoint : String,
+  titles : Array[String],
+  show_content : Bool,
+) -> Unit {
+  if !show_content {
+    for title in titles {
+      println(title)
+    }
+    return
+  }
+  match fetch_page_contents(endpoint, titles) {
+    Ok(contents) => print_page_contents(titles, contents)
+    Err(message) => println("error: \{message}")
+  }
 }
 
 ///|
@@ -424,6 +453,157 @@ fn limit_titles(titles : Array[String], limit : Int?) -> Array[String] {
       limited
     }
   }
+}
+
+///|
+fn fetch_page_contents(
+  endpoint : String,
+  titles : Array[String],
+) -> Result[Map[String, String], String] {
+  let contents = {}
+  let mut start = 0
+  while start < titles.length() {
+    let batch = slice_titles(titles, start, start + CONTENT_BATCH_SIZE)
+    let payload = match fetch_page_content_batch(endpoint, batch) {
+      Ok(payload) => payload
+      Err(message) => return Err(message)
+    }
+    let parsed = match parse_page_content_payload(payload) {
+      Ok(parsed) => parsed
+      Err(message) => return Err(message)
+    }
+    for entry in parsed.iter() {
+      contents[entry.0] = entry.1
+    }
+    start += CONTENT_BATCH_SIZE
+  }
+  Ok(contents)
+}
+
+///|
+fn slice_titles(
+  titles : Array[String],
+  start : Int,
+  end : Int,
+) -> Array[String] {
+  let slice = []
+  let stop = if end < titles.length() { end } else { titles.length() }
+  for i = start; i < stop; i = i + 1 {
+    slice.push(titles[i])
+  }
+  slice
+}
+
+///|
+fn fetch_page_content_batch(
+  endpoint : String,
+  titles : Array[String],
+) -> Result[String, String] {
+  let temp_path = temporary_output_path()
+  let command = build_page_content_command(endpoint, titles, temp_path)
+  let status = run_shell_command(command)
+  if status != 0 {
+    ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+    return Err("curl request failed")
+  }
+  let contents = read_file_to_string(temp_path)
+  ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+  contents
+}
+
+///|
+fn build_page_content_command(
+  endpoint : String,
+  titles : Array[String],
+  temp_path : String,
+) -> String {
+  let mut command = "curl --silent --show-error --fail --get"
+  command += " --user-agent " +
+    shell_quote("mediawiki-template-usage/0.1 (local MoonBit CLI)")
+  command += " --data-urlencode " + shell_quote("action=query")
+  command += " --data-urlencode " + shell_quote("format=json")
+  command += " --data-urlencode " + shell_quote("formatversion=2")
+  command += " --data-urlencode " + shell_quote("prop=revisions")
+  command += " --data-urlencode " + shell_quote("rvprop=content")
+  command += " --data-urlencode " + shell_quote("rvslots=main")
+  command += " --data-urlencode " + shell_quote("titles=" + titles.join("|"))
+  command += " " + shell_quote(endpoint)
+  command += " > " + shell_quote(temp_path)
+  command
+}
+
+///|
+fn parse_page_content_payload(
+  payload : String,
+) -> Result[Map[String, String], String] {
+  let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
+  match parsed {
+    Err(error) => Err("invalid JSON response: \{error.to_string()}")
+    Ok(json) => extract_page_content_response(json)
+  }
+}
+
+///|
+fn extract_page_content_response(
+  json : Json,
+) -> Result[Map[String, String], String] {
+  guard json is Json::Object(root) else {
+    return Err("response root is not an object")
+  }
+  guard root.get("query") is Some(Json::Object(query)) else {
+    return Err("query is not an object")
+  }
+  guard query.get("pages") is Some(Json::Array(pages)) else {
+    return Err("query.pages is not an array")
+  }
+  let contents = {}
+  for page in pages {
+    guard page is Json::Object(page_obj) else { continue }
+    guard page_obj.get("title") is Some(Json::String(title)) else { continue }
+    let content = extract_page_revision_content(page_obj)
+    contents[title] = content
+  }
+  Ok(contents)
+}
+
+///|
+fn extract_page_revision_content(page_obj : Map[String, Json]) -> String {
+  match page_obj.get("revisions") {
+    Some(Json::Array([Json::Object(revision), ..])) =>
+      match revision.get("slots") {
+        Some(Json::Object(slots)) =>
+          match slots.get("main") {
+            Some(Json::Object(main_slot)) =>
+              match main_slot.get("content") {
+                Some(Json::String(content)) => content
+                _ => ""
+              }
+            _ => ""
+          }
+        _ => ""
+      }
+    _ => ""
+  }
+}
+
+///|
+fn print_page_contents(
+  titles : Array[String],
+  contents : Map[String, String],
+) -> Unit {
+  let mut first = true
+  for title in titles {
+    if !first {
+      println("")
+    }
+    first = false
+    println(render_page_content(title, contents.get_or_default(title, "")))
+  }
+}
+
+///|
+fn render_page_content(title : String, content : String) -> String {
+  "=== " + title + " ===\n" + content
 }
 
 ///|

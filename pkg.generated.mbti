@@ -24,6 +24,7 @@ pub(all) struct Config {
   template_name : String
   limit : Int?
   sort_by : SortBy
+  show_content : Bool
 } derive(Eq)
 pub impl Show for Config
 

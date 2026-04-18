@@ -58,3 +58,44 @@ test "sort titles preserves api order" {
   let titles = ["B", "A", "C"]
   assert_eq(sort_titles(titles, Api), ["B", "A", "C"])
 }
+
+///|
+test "extract page content response" {
+  let payload =
+    #|{
+    #|  "query": {
+    #|    "pages": [
+    #|      {
+    #|        "title": "Albert Einstein",
+    #|        "revisions": [
+    #|          { "slots": { "main": { "content": "{{Infobox scientist}}\nBody" } } }
+    #|        ]
+    #|      },
+    #|      {
+    #|        "title": "Physics",
+    #|        "revisions": [
+    #|          { "slots": { "main": { "content": "Plain text" } } }
+    #|        ]
+    #|      }
+    #|    ]
+    #|  }
+    #|}
+  match parse_page_content_payload(payload) {
+    Ok(contents) => {
+      assert_eq(
+        contents.get("Albert Einstein"),
+        Some("{{Infobox scientist}}\nBody"),
+      )
+      assert_eq(contents.get("Physics"), Some("Plain text"))
+    }
+    Err(message) => fail(message)
+  }
+}
+
+///|
+test "render page content prefixes title" {
+  assert_eq(
+    render_page_content("Albert Einstein", "{{Infobox scientist}}\nBody"),
+    "=== Albert Einstein ===\n{{Infobox scientist}}\nBody",
+  )
+}
