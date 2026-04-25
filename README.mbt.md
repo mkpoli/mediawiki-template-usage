@@ -35,10 +35,11 @@ After downloading a release archive, run the packaged binary directly:
 ./mediawiki-template-usage <source> <template>
 ./mediawiki-template-usage enwp "Citation needed"
 ./mediawiki-template-usage ./dumps/enwiki "Citation needed"
+./mediawiki-template-usage enwp "Citation needed" --category "Living people"
 ./mediawiki-template-usage enwp "Citation needed" --limit 20 --show-content
 ```
 
-Use `./mediawiki-template-usage --help` to see available options such as `--limit`, `--sort-by`, and `--show-content`.
+Use `./mediawiki-template-usage --help` to see available options such as `--limit`, `--sort-by`, `--category`, and `--show-content`.
 
 `<source>` can be a full MediaWiki API endpoint, a shorthand alias like `enwp` or `wikidata`, or a directory containing Wikimedia XML dump files such as `pages-articles*.xml`, `.xml.bz2`, or `.xml.gz`.
 
@@ -50,7 +51,8 @@ From the project root, run the CLI through MoonBit:
 moon run cmd/main -- <source> <template>
 moon run cmd/main -- enwp "Citation needed"
 moon run cmd/main -- ./dumps/enwiki "Citation needed"
+moon run cmd/main -- enwp "Citation needed" --category "Living people"
 moon run cmd/main -- enwp "Citation needed" --limit 20 --show-content
 ```
 
-Use `moon run cmd/main -- --help` to see available options such as `--limit`, `--sort-by`, and `--show-content`.
+Use `moon run cmd/main -- --help` to see available options such as `--limit`, `--sort-by`, `--category`, and `--show-content`.

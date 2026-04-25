@@ -22,9 +22,41 @@ test "extract embeddedin response and continue token" {
     #|    ]
     #|  }
     #|}
-  match parse_embeddedin_payload(payload) {
+  match parse_template_usage_payload(payload, None, false) {
     Ok((titles, Some(token))) => {
       assert_eq(titles, ["Page One", "Page Two"])
+      assert_eq(token, "10|Template:Infobox_person")
+    }
+    _ => panic()
+  }
+}
+
+///|
+test "extract filtered embeddedin response and continue token" {
+  let payload =
+    #|{
+    #|  "continue": { "geicontinue": "10|Template:Infobox_person", "continue": "||" },
+    #|  "query": {
+    #|    "pages": [
+    #|      {
+    #|        "title": "Page One",
+    #|        "categories": [
+    #|          { "title": "Category:Living people" }
+    #|        ]
+    #|      },
+    #|      {
+    #|        "title": "Page Two",
+    #|        "categories": [
+    #|          { "title": "Category:Other" }
+    #|        ]
+    #|      }
+    #|    ]
+    #|  }
+    #|}
+  match
+    parse_template_usage_payload(payload, Some("Category:Living people"), false) {
+    Ok((titles, Some(token))) => {
+      assert_eq(titles, ["Page One"])
       assert_eq(token, "10|Template:Infobox_person")
     }
     _ => panic()
@@ -51,13 +83,30 @@ test "parse dump page matches extracts titles and content" {
   let payload =
     #|<page><title>Page One</title><revision><text xml:space="preserve">{{Citation needed|date=2024}}</text></revision></page>
     #|<page><title>Page &amp; Two</title><revision><text xml:space="preserve">Before &lt;tag&gt;{{Citation needed}}&lt;/tag&gt;</text></revision></page>
-  let (titles, contents) = parse_dump_page_matches(payload)
+  let (titles, contents) = parse_dump_page_matches(payload, None)
   assert_eq(titles, ["Page One", "Page & Two"])
   assert_eq(contents.get("Page One"), Some("{{Citation needed|date=2024}}"))
   assert_eq(
     contents.get("Page & Two"),
     Some("Before <tag>{{Citation needed}}</tag>"),
   )
+}
+
+///|
+test "parse dump page matches applies category filter" {
+  let payload =
+    #|<page><title>Page One</title><revision><text xml:space="preserve">{{Citation needed}} [[Category:Living people]]</text></revision></page>
+    #|<page><title>Page Two</title><revision><text xml:space="preserve">{{Citation needed}} [[Category:Physics]]</text></revision></page>
+  let (titles, contents) = parse_dump_page_matches(
+    payload,
+    Some("Category:Living people"),
+  )
+  assert_eq(titles, ["Page One"])
+  assert_eq(
+    contents.get("Page One"),
+    Some("{{Citation needed}} [[Category:Living people]]"),
+  )
+  assert_eq(contents.get("Page Two"), None)
 }
 
 ///|
@@ -136,4 +185,20 @@ test "render page content prefixes title" {
     render_page_content("Albert Einstein", ["{{Infobox scientist}}"]),
     "= Albert Einstein =\n{{Infobox scientist}}",
   )
+}
+
+///|
+test "normalize category name" {
+  assert_eq(normalize_category_name("Living people"), "Category:Living people")
+  assert_eq(
+    normalize_category_name("Category:All articles with unsourced statements"),
+    "Category:All articles with unsourced statements",
+  )
+}
+
+///|
+test "normalize cli args expands verbose alias" {
+  assert_eq(normalize_cli_args(["enwp", "Citation needed", "-v"]), [
+    "enwp", "Citation needed", "--verbose",
+  ])
 }

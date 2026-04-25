@@ -31,9 +31,11 @@ pub impl Show for SortBy with output(self, logger) {
 pub(all) struct Config {
   endpoint : String
   template_name : String
+  category_name : String?
   limit : Int?
   sort_by : SortBy
   show_content : Bool
+  verbose : Bool
 } derive(Eq)
 
 ///|
@@ -42,12 +44,16 @@ pub impl Show for Config with output(self, logger) {
   logger.write_object(self.endpoint)
   logger.write_string(", template_name: ")
   logger.write_object(self.template_name)
+  logger.write_string(", category_name: ")
+  logger.write_object(self.category_name)
   logger.write_string(", limit: ")
   logger.write_object(self.limit)
   logger.write_string(", sort_by: ")
   logger.write_object(self.sort_by)
   logger.write_string(", show_content: ")
   logger.write_object(self.show_content)
+  logger.write_string(", verbose: ")
+  logger.write_object(self.verbose)
   logger.write_string(" }")
 }
 
@@ -95,12 +101,15 @@ extern "c" fn unlink_ffi(path : Bytes) -> Int = "unlink"
 pub fn run_cli(args : Array[String]) -> Unit {
   try {
     let config = parse_config(args)
+    debug_log(config.verbose, "config: " + config.to_string())
     match
       fetch_all_template_usages(
         config.endpoint,
         config.template_name,
+        config.category_name,
         config.sort_by,
         config.limit,
+        config.verbose,
       ) {
       Ok(results) =>
         output_results(
@@ -109,6 +118,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
           results.titles,
           results.page_contents,
           config.show_content,
+          config.verbose,
         )
       Err(message) => println("error: \{message}")
     }
@@ -121,13 +131,17 @@ pub fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template from a MediaWiki API or a local Wikimedia dumps folder.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production (dumps): ./mediawiki-template-usage ./dumps/enwiki \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    about="List pages that transclude a MediaWiki template from a MediaWiki API or a local Wikimedia dumps folder.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Production (dumps): ./mediawiki-template-usage ./dumps/enwiki \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
     version="0.1.2",
     arg_required_else_help=true,
     flags=[
       @argparse.FlagArg::new(
         "show-content",
         about="Fetch and print only matching template usages for the final results. Best used with --limit.",
+      ),
+      @argparse.FlagArg::new(
+        "verbose",
+        about="Print debug details about API requests, payloads, and filtering. `-v` is accepted as an alias.",
       ),
     ],
     options=[
@@ -142,6 +156,11 @@ pub fn command() -> @argparse.Command {
         short='s',
         about="Sort order: api, title-asc, or title-desc. api preserves API or dump order.",
         default_values=["api"],
+      ),
+      @argparse.OptionArg::new(
+        "category",
+        short='c',
+        about="Only include pages that are in the given category, with or without the Category: prefix.",
       ),
     ],
     positionals=[
@@ -161,7 +180,7 @@ pub fn command() -> @argparse.Command {
 
 ///|
 pub fn parse_config(args : Array[String]) -> Config raise CliError {
-  let matches = command().parse(argv=extract_cli_args(args)) catch {
+  let matches = command().parse(argv=normalize_cli_args(extract_cli_args(args))) catch {
     err => raise Message(err.to_string())
   }
   let values = matches.values
@@ -172,6 +191,10 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     raise Message("missing template argument")
   }
   let endpoint = resolve_endpoint(raw_endpoint)
+  let category_name = match values.get("category") {
+    Some([raw_category, ..]) => Some(normalize_category_name(raw_category))
+    _ => None
+  }
   let limit = match values.get("limit") {
     Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
     _ => Some(10)
@@ -181,7 +204,16 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     _ => Api
   }
   let show_content = matches.flags.get_or_default("show-content", false)
-  { endpoint, template_name, limit, sort_by, show_content }
+  let verbose = matches.flags.get_or_default("verbose", false)
+  {
+    endpoint,
+    template_name,
+    category_name,
+    limit,
+    sort_by,
+    show_content,
+    verbose,
+  }
 }
 
 ///|
@@ -191,7 +223,13 @@ fn output_results(
   titles : Array[String],
   page_contents : Map[String, String]?,
   show_content : Bool,
+  verbose : Bool,
 ) -> Unit {
+  let result_mode = if show_content { " with content" } else { " titles only" }
+  debug_log(
+    verbose,
+    "final result count: " + titles.length().to_string() + result_mode,
+  )
   if !show_content {
     for title in titles {
       println(title)
@@ -199,12 +237,20 @@ fn output_results(
     return
   }
   match page_contents {
-    Some(contents) => print_page_contents(titles, template_name, contents)
-    None =>
+    Some(contents) => {
+      debug_log(verbose, "using page contents extracted from dump matches")
+      print_page_contents(titles, template_name, contents)
+    }
+    None => {
+      debug_log(
+        verbose,
+        "fetching page contents in batches of " + CONTENT_BATCH_SIZE.to_string(),
+      )
       match fetch_page_contents(endpoint, titles) {
         Ok(contents) => print_page_contents(titles, template_name, contents)
         Err(message) => println("error: \{message}")
       }
+    }
   }
 }
 
@@ -353,47 +399,109 @@ fn copy_args_from(args : Array[String], start : Int) -> Array[String] {
 }
 
 ///|
+fn normalize_cli_args(args : Array[String]) -> Array[String] {
+  let normalized = []
+  for arg in args {
+    if arg == "-v" {
+      normalized.push("--verbose")
+    } else {
+      normalized.push(arg)
+    }
+  }
+  normalized
+}
+
+///|
 fn fetch_all_template_usages(
   endpoint : String,
   template_name : String,
+  category_name : String?,
   sort_by : SortBy,
   limit : Int?,
+  verbose : Bool,
 ) -> Result[UsageResults, String] {
+  let normalized_template = normalize_template_name(template_name)
+  let category_suffix = match category_name {
+    Some(category) => " in " + category
+    None => " without category filter"
+  }
+  debug_log(
+    verbose,
+    "fetching usages for " + normalized_template + category_suffix,
+  )
   if path_is_directory(endpoint) {
-    let results = match fetch_dump_template_usages(endpoint, template_name) {
+    let results = match
+      fetch_dump_template_usages(
+        endpoint, template_name, category_name, verbose,
+      ) {
       Ok(results) => results
       Err(message) => return Err(message)
     }
-    return Ok({
-      titles: limit_titles(sort_titles(results.titles, sort_by), limit),
-      page_contents: results.page_contents,
-    })
+    let sorted = sort_titles(results.titles, sort_by)
+    let limited = limit_titles(sorted, limit)
+    let limit_suffix = match limit {
+      Some(value) => ", limit=" + value.to_string()
+      None => ", no limit"
+    }
+    debug_log(
+      verbose,
+      "collected " +
+      results.titles.length().to_string() +
+      " dump titles before limit; returning " +
+      limited.length().to_string() +
+      " after sort=" +
+      sort_by.to_string() +
+      limit_suffix,
+    )
+    return Ok({ titles: limited, page_contents: results.page_contents })
   }
   let titles = match
     fetch_all_template_usage_titles(
       endpoint,
-      normalize_template_name(template_name),
+      normalized_template,
+      category_name,
       None,
       [],
+      verbose,
     ) {
     Ok(titles) => titles
     Err(message) => return Err(message)
   }
-  Ok({
-    titles: limit_titles(sort_titles(titles, sort_by), limit),
-    page_contents: None,
-  })
+  let sorted = sort_titles(titles, sort_by)
+  let limited = limit_titles(sorted, limit)
+  let limit_suffix = match limit {
+    Some(value) => ", limit=" + value.to_string()
+    None => ", no limit"
+  }
+  debug_log(
+    verbose,
+    "collected " +
+    titles.length().to_string() +
+    " titles before limit; returning " +
+    limited.length().to_string() +
+    " after sort=" +
+    sort_by.to_string() +
+    limit_suffix,
+  )
+  Ok({ titles: limited, page_contents: None })
 }
 
 ///|
 fn fetch_dump_template_usages(
   dump_dir : String,
   template_name : String,
+  category_name : String?,
+  verbose : Bool,
 ) -> Result[UsageResults, String] {
   let temp_path = temporary_dump_matches_path()
   let command = build_dump_search_command(dump_dir, template_name, temp_path)
+  debug_log(
+    verbose,
+    "scanning dump directory " + dump_dir + " for template matches",
+  )
   let status = run_shell_command(command)
   if status != 0 && !is_no_match_exit_status(status) {
+    debug_log(verbose, "dump scan exited with status " + status.to_string())
     ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
     return Err("dump scan failed")
   }
@@ -405,7 +513,11 @@ fn fetch_dump_template_usages(
     }
   }
   ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
-  let (titles, page_contents) = parse_dump_page_matches(matches)
+  let (titles, page_contents) = parse_dump_page_matches(matches, category_name)
+  debug_log(
+    verbose,
+    "parsed " + titles.length().to_string() + " dump pages after filtering",
+  )
   Ok({ titles, page_contents: Some(page_contents) })
 }
 
@@ -466,19 +578,90 @@ fn escape_template_name_for_regex(template_name : String) -> String {
 ///|
 fn parse_dump_page_matches(
   payload : String,
+  category_name : String?,
 ) -> (Array[String], Map[String, String]) {
   let titles = []
   let page_contents = {}
   for page in extract_xml_page_blocks(payload) {
     match extract_dump_page_title(page) {
       Some(title) => {
-        titles.push(title)
-        page_contents[title] = extract_dump_page_content(page)
+        let content = extract_dump_page_content(page)
+        if dump_page_matches_category(content, category_name) {
+          titles.push(title)
+          page_contents[title] = content
+        }
       }
       None => ()
     }
   }
   (titles, page_contents)
+}
+
+///|
+fn dump_page_matches_category(
+  content : String,
+  category_name : String?,
+) -> Bool {
+  match category_name {
+    Some(category_title) => content_has_category_link(content, category_title)
+    None => true
+  }
+}
+
+///|
+fn content_has_category_link(content : String, category_title : String) -> Bool {
+  let normalized_category = normalize_category_target(category_title)
+  let len = content.length()
+  let mut i = 0
+  while i + 1 < len {
+    if is_double_open_bracket(content, i) {
+      let end = find_wikilink_end(content, i)
+      if end > i {
+        let snippet = content[i:end].to_string()
+        if normalize_category_target(extract_wikilink_target(snippet)) ==
+          normalized_category {
+          return true
+        }
+        i = end
+        continue
+      }
+    }
+    i += 1
+  }
+  false
+}
+
+///|
+fn extract_wikilink_target(snippet : String) -> String {
+  if snippet.length() < 4 {
+    return ""
+  }
+  let body = snippet[2:snippet.length() - 2].to_string().trim().to_string()
+  body.split("|").to_array()[0].trim().to_string()
+}
+
+///|
+fn find_wikilink_end(content : String, start : Int) -> Int {
+  let len = content.length()
+  let mut i = start + 2
+  while i + 1 < len {
+    if is_double_close_bracket(content, i) {
+      return i + 2
+    }
+    i += 1
+  }
+  -1
+}
+
+///|
+fn normalize_category_target(category_name : String) -> String {
+  let normalized = category_name.replace(old="_", new=" ").trim().to_string()
+  let lowered = normalized.to_lower()
+  if lowered.has_prefix("category:") {
+    lowered[9:].trim().to_string()
+  } else {
+    lowered
+  }
 }
 
 ///|
@@ -597,18 +780,39 @@ fn decode_xml_entities(text : String) -> String {
 fn fetch_all_template_usage_titles(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
   acc : Array[String],
+  verbose : Bool,
 ) -> Result[Array[String], String] {
+  let continue_suffix = match continue_token {
+    Some(token) => " with continue=" + token
+    None => " (first page)"
+  }
+  debug_log(verbose, "requesting usage page" + continue_suffix)
   let payload = match
-    fetch_embeddedin_page(endpoint, template_title, continue_token) {
+    fetch_template_usage_page(
+      endpoint, template_title, category_name, continue_token, verbose,
+    ) {
     Ok(payload) => payload
     Err(message) => return Err(message)
   }
-  let (titles, next_token) = match parse_embeddedin_payload(payload) {
+  let (titles, next_token) = match
+    parse_template_usage_payload(payload, category_name, verbose) {
     Ok(result) => result
     Err(message) => return Err(message)
   }
+  let next_token_suffix = match next_token {
+    Some(token) => "; next continue=" + token
+    None => "; no continuation"
+  }
+  debug_log(
+    verbose,
+    "parsed " +
+    titles.length().to_string() +
+    " titles from payload" +
+    next_token_suffix,
+  )
   for title in titles {
     acc.push(title)
   }
@@ -617,8 +821,10 @@ fn fetch_all_template_usage_titles(
       fetch_all_template_usage_titles(
         endpoint,
         template_title,
+        category_name,
         Some(token),
         acc,
+        verbose,
       )
     None => Ok(acc)
   }
@@ -964,35 +1170,70 @@ fn is_double_open_brace(content : String, index : Int) -> Bool {
 }
 
 ///|
+fn is_double_open_bracket(content : String, index : Int) -> Bool {
+  content.code_unit_at(index).to_int() == 91 &&
+  content.code_unit_at(index + 1).to_int() == 91
+}
+
+///|
 fn is_double_close_brace(content : String, index : Int) -> Bool {
   content.code_unit_at(index).to_int() == 125 &&
   content.code_unit_at(index + 1).to_int() == 125
 }
 
 ///|
-fn fetch_embeddedin_page(
+fn is_double_close_bracket(content : String, index : Int) -> Bool {
+  content.code_unit_at(index).to_int() == 93 &&
+  content.code_unit_at(index + 1).to_int() == 93
+}
+
+///|
+fn fetch_template_usage_page(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
+  verbose : Bool,
 ) -> Result[String, String] {
   let temp_path = temporary_output_path()
-  let command = build_curl_command(
-    endpoint, template_title, continue_token, temp_path,
+  let command = build_template_usage_command(
+    endpoint, template_title, category_name, continue_token, temp_path,
+  )
+  debug_log(
+    verbose,
+    "running request: " +
+    describe_template_usage_request(
+      endpoint, template_title, category_name, continue_token,
+    ),
   )
   let status = run_shell_command(command)
   if status != 0 {
+    debug_log(verbose, "curl exited with status " + status.to_string())
     ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
     return Err("curl request failed")
   }
   let contents = read_file_to_string(temp_path)
   ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
-  contents
+  match contents {
+    Ok(payload) => {
+      debug_log(
+        verbose,
+        "received payload with " +
+        payload.length().to_string() +
+        " characters: " +
+        preview_text(payload, 240),
+      )
+      Ok(payload)
+    }
+    Err(message) => Err(message)
+  }
 }
 
 ///|
-fn build_curl_command(
+fn build_template_usage_command(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
   temp_path : String,
 ) -> String {
@@ -1001,14 +1242,34 @@ fn build_curl_command(
     shell_quote("mediawiki-template-usage/0.1 (local MoonBit CLI)")
   command += " --data-urlencode " + shell_quote("action=query")
   command += " --data-urlencode " + shell_quote("format=json")
-  command += " --data-urlencode " + shell_quote("list=embeddedin")
-  command += " --data-urlencode " + shell_quote("eilimit=max")
+  command += " --data-urlencode " + shell_quote("formatversion=2")
   command += " --data-urlencode " + shell_quote("continue=")
-  command += " --data-urlencode " + shell_quote("eititle=" + template_title)
-  match continue_token {
-    Some(token) =>
-      command += " --data-urlencode " + shell_quote("eicontinue=" + token)
-    None => ()
+  match category_name {
+    Some(category_title) => {
+      command += " --data-urlencode " + shell_quote("generator=embeddedin")
+      command += " --data-urlencode " + shell_quote("geilimit=max")
+      command += " --data-urlencode " +
+        shell_quote("geititle=" + template_title)
+      command += " --data-urlencode " + shell_quote("prop=categories")
+      command += " --data-urlencode " + shell_quote("cllimit=max")
+      command += " --data-urlencode " +
+        shell_quote("clcategories=" + category_title)
+      match continue_token {
+        Some(token) =>
+          command += " --data-urlencode " + shell_quote("geicontinue=" + token)
+        None => ()
+      }
+    }
+    None => {
+      command += " --data-urlencode " + shell_quote("list=embeddedin")
+      command += " --data-urlencode " + shell_quote("eilimit=max")
+      command += " --data-urlencode " + shell_quote("eititle=" + template_title)
+      match continue_token {
+        Some(token) =>
+          command += " --data-urlencode " + shell_quote("eicontinue=" + token)
+        None => ()
+      }
+    }
   }
   command += " " + shell_quote(endpoint)
   command += " > " + shell_quote(temp_path)
@@ -1016,13 +1277,26 @@ fn build_curl_command(
 }
 
 ///|
-fn parse_embeddedin_payload(
+fn parse_template_usage_payload(
   payload : String,
+  category_name : String?,
+  verbose : Bool,
 ) -> Result[(Array[String], String?), String] {
   let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
   match parsed {
-    Err(error) => Err("invalid JSON response: \{error.to_string()}")
-    Ok(json) => extract_embeddedin_response(json)
+    Err(error) => {
+      debug_log(
+        verbose,
+        "failed to parse JSON payload: " + preview_text(payload, 240),
+      )
+      Err("invalid JSON response: \{error.to_string()}")
+    }
+    Ok(json) =>
+      match category_name {
+        Some(category_title) =>
+          extract_filtered_embeddedin_response(json, category_title, verbose)
+        None => extract_embeddedin_response(json)
+      }
   }
 }
 
@@ -1068,12 +1342,142 @@ fn extract_embeddedin_response(
 }
 
 ///|
+fn extract_filtered_embeddedin_response(
+  json : Json,
+  category_title : String,
+  verbose : Bool,
+) -> Result[(Array[String], String?), String] {
+  guard json is Json::Object(root) else {
+    return Err("response root is not an object")
+  }
+
+  let titles = []
+  let mut page_count = 0
+  let mut categorized_page_count = 0
+  match root.get("query") {
+    Some(Json::Object(query)) =>
+      match query.get("pages") {
+        Some(Json::Array(pages)) =>
+          for page in pages {
+            page_count += 1
+            guard page is Json::Object(page_obj) else { continue }
+            guard page_obj.get("title") is Some(Json::String(title)) else {
+              continue
+            }
+            if page_obj.get("categories") is Some(Json::Array(_)) {
+              categorized_page_count += 1
+            }
+            if page_matches_category(page_obj, category_title) {
+              titles.push(title)
+            }
+          }
+        Some(_) => return Err("query.pages is not an array")
+        None => ()
+      }
+    Some(_) => return Err("query is not an object")
+    None => ()
+  }
+
+  let next_token = match root.get("continue") {
+    Some(Json::Object(cont)) =>
+      match cont.get("geicontinue") {
+        Some(Json::String(token)) => Some(token)
+        Some(_) => return Err("continue.geicontinue is not a string")
+        None => None
+      }
+    Some(_) => return Err("continue is not an object")
+    None => None
+  }
+
+  debug_log(
+    verbose,
+    "category filter kept " +
+    titles.length().to_string() +
+    " of " +
+    page_count.to_string() +
+    " pages; " +
+    categorized_page_count.to_string() +
+    " pages included category data",
+  )
+
+  Ok((titles, next_token))
+}
+
+///|
+fn describe_template_usage_request(
+  endpoint : String,
+  template_title : String,
+  category_name : String?,
+  continue_token : String?,
+) -> String {
+  let description = "endpoint=" + endpoint + ", template=" + template_title
+  let description = match category_name {
+    Some(category) =>
+      description + ", category=" + category + ", mode=generator+categories"
+    None => description + ", mode=embeddedin"
+  }
+  match continue_token {
+    Some(token) => description + ", continue=" + token
+    None => description
+  }
+}
+
+///|
+fn preview_text(value : String, limit : Int) -> String {
+  let compact = value.replace(old="\n", new=" ").replace(old="\r", new=" ")
+  if compact.length() <= limit {
+    compact
+  } else {
+    compact[:limit].to_string() + "..."
+  }
+}
+
+///|
+fn debug_log(verbose : Bool, message : String) -> Unit {
+  if verbose {
+    println("[verbose] " + message)
+  }
+}
+
+///|
+fn page_matches_category(
+  page_obj : Map[String, Json],
+  category_title : String,
+) -> Bool {
+  match page_obj.get("categories") {
+    Some(Json::Array(categories)) => {
+      for category in categories {
+        guard category is Json::Object(category_obj) else { continue }
+        guard category_obj.get("title") is Some(Json::String(title)) else {
+          continue
+        }
+        if title == category_title {
+          return true
+        }
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
 fn normalize_template_name(template_name : String) -> String {
   let trimmed = template_name.trim().to_string()
   if trimmed.has_prefix("Template:") {
     trimmed
   } else {
     "Template:" + trimmed
+  }
+}
+
+///|
+fn normalize_category_name(category_name : String) -> String {
+  let trimmed = category_name.trim().to_string()
+  if trimmed.has_prefix("Category:") {
+    trimmed
+  } else {
+    "Category:" + trimmed
   }
 }
 

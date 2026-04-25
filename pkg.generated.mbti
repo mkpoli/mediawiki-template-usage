@@ -22,9 +22,11 @@ pub impl Show for CliError
 pub(all) struct Config {
   endpoint : String
   template_name : String
+  category_name : String?
   limit : Int?
   sort_by : SortBy
   show_content : Bool
+  verbose : Bool
 } derive(Eq)
 pub impl Show for Config
 
