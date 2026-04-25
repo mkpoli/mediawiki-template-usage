@@ -134,6 +134,7 @@ pub fn command() -> @argparse.Command {
       ),
       @argparse.FlagArg::new(
         "verbose",
+        short='v',
         about="Print debug details about API requests, payloads, and filtering. `-v` is accepted as an alias.",
       ),
     ],

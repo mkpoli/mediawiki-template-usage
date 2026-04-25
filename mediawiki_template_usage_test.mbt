@@ -95,10 +95,13 @@ test "parse config accepts verbose long flag" {
 ///|
 test "render help mentions limit and template" {
   let help = @mediawiki_template_usage.command().render_help()
+  assert_true(help.contains("-h, --help"))
   assert_true(help.contains("--limit"))
+  assert_true(help.contains("-l, --limit"))
   assert_true(help.contains("[default: 10]"))
   assert_true(help.contains("--sort-by"))
   assert_true(help.contains("--category"))
+  assert_true(help.contains("-v, --verbose"))
   assert_true(help.contains("--verbose"))
   assert_true(help.contains("--show-content"))
   assert_true(help.contains("template"))
