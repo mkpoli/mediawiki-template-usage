@@ -5,7 +5,7 @@
   "repository": "",
   "license": "Apache-2.0",
   "keywords": [],
-  "description": "CLI for listing MediaWiki pages that use a template via the embeddedin API",
+  "description": "CLI for listing MediaWiki pages that use a template via the MediaWiki API or local Wikimedia dumps",
   "preferred-target": "native",
   "supported-targets": "native"
 }

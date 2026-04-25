@@ -52,6 +52,12 @@ pub impl Show for Config with output(self, logger) {
 }
 
 ///|
+priv struct UsageResults {
+  titles : Array[String]
+  page_contents : Map[String, String]?
+}
+
+///|
 pub(all) suberror CliError {
   Message(String)
 }
@@ -96,11 +102,12 @@ pub fn run_cli(args : Array[String]) -> Unit {
         config.sort_by,
         config.limit,
       ) {
-      Ok(titles) =>
+      Ok(results) =>
         output_results(
           config.endpoint,
           config.template_name,
-          titles,
+          results.titles,
+          results.page_contents,
           config.show_content,
         )
       Err(message) => println("error: \{message}")
@@ -114,7 +121,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template via the embeddedin API.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    about="List pages that transclude a MediaWiki template from a MediaWiki API or a local Wikimedia dumps folder.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production (dumps): ./mediawiki-template-usage ./dumps/enwiki \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
     version="0.1.2",
     arg_required_else_help=true,
     flags=[
@@ -133,14 +140,14 @@ pub fn command() -> @argparse.Command {
       @argparse.OptionArg::new(
         "sort-by",
         short='s',
-        about="Sort order: api, title-asc, or title-desc.",
+        about="Sort order: api, title-asc, or title-desc. api preserves API or dump order.",
         default_values=["api"],
       ),
     ],
     positionals=[
       @argparse.PositionArg::new(
-        "endpoint",
-        about="MediaWiki API endpoint or alias, for example https://en.wikipedia.org/w/api.php, enwp, commons, or wikidata",
+        "source",
+        about="MediaWiki API endpoint, alias, or local dump directory, for example https://en.wikipedia.org/w/api.php, enwp, commons, wikidata, or ./dumps/enwiki",
         num_args=@argparse.ValueRange::single(),
       ),
       @argparse.PositionArg::new(
@@ -158,8 +165,8 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     err => raise Message(err.to_string())
   }
   let values = matches.values
-  guard values.get("endpoint") is Some([raw_endpoint, ..]) else {
-    raise Message("missing endpoint argument")
+  guard values.get("source") is Some([raw_endpoint, ..]) else {
+    raise Message("missing source argument")
   }
   guard values.get("template") is Some([template_name, ..]) else {
     raise Message("missing template argument")
@@ -182,6 +189,7 @@ fn output_results(
   endpoint : String,
   template_name : String,
   titles : Array[String],
+  page_contents : Map[String, String]?,
   show_content : Bool,
 ) -> Unit {
   if !show_content {
@@ -190,9 +198,13 @@ fn output_results(
     }
     return
   }
-  match fetch_page_contents(endpoint, titles) {
-    Ok(contents) => print_page_contents(titles, template_name, contents)
-    Err(message) => println("error: \{message}")
+  match page_contents {
+    Some(contents) => print_page_contents(titles, template_name, contents)
+    None =>
+      match fetch_page_contents(endpoint, titles) {
+        Ok(contents) => print_page_contents(titles, template_name, contents)
+        Err(message) => println("error: \{message}")
+      }
   }
 }
 
@@ -202,13 +214,29 @@ fn resolve_endpoint(raw_endpoint : String) -> String raise CliError {
   if endpoint.contains("://") {
     return endpoint
   }
+  if path_is_directory(endpoint) {
+    return endpoint
+  }
   match endpoint {
     "commons" => "https://commons.wikimedia.org/w/api.php"
     "meta" => "https://meta.wikimedia.org/w/api.php"
     "mediawiki" | "mw" => "https://www.mediawiki.org/w/api.php"
     "wikidata" | "wd" => "https://www.wikidata.org/w/api.php"
-    _ => resolve_language_project_alias(endpoint)
+    _ => {
+      if looks_like_local_path(endpoint) {
+        raise Message("dump directory '\{endpoint}' does not exist")
+      }
+      resolve_language_project_alias(endpoint)
+    }
   }
+}
+
+///|
+fn looks_like_local_path(path : String) -> Bool {
+  path.contains("/") ||
+  path.contains("\\") ||
+  path.has_prefix(".") ||
+  path.has_prefix("~")
 }
 
 ///|
@@ -262,7 +290,7 @@ fn resolve_language_project_alias(shorthand : String) -> String raise CliError {
     )
   }
   raise Message(
-    "unknown endpoint alias '\{shorthand}'. Use a full https://.../w/api.php endpoint or a known alias like enwp, commons, meta, mediawiki, or wikidata",
+    "unknown source '\{shorthand}'. Use a full https://.../w/api.php endpoint, an existing dump directory, or a known alias like enwp, commons, meta, mediawiki, or wikidata",
   )
 }
 
@@ -330,7 +358,17 @@ fn fetch_all_template_usages(
   template_name : String,
   sort_by : SortBy,
   limit : Int?,
-) -> Result[Array[String], String] {
+) -> Result[UsageResults, String] {
+  if path_is_directory(endpoint) {
+    let results = match fetch_dump_template_usages(endpoint, template_name) {
+      Ok(results) => results
+      Err(message) => return Err(message)
+    }
+    return Ok({
+      titles: limit_titles(sort_titles(results.titles, sort_by), limit),
+      page_contents: results.page_contents,
+    })
+  }
   let titles = match
     fetch_all_template_usage_titles(
       endpoint,
@@ -341,7 +379,218 @@ fn fetch_all_template_usages(
     Ok(titles) => titles
     Err(message) => return Err(message)
   }
-  Ok(limit_titles(sort_titles(titles, sort_by), limit))
+  Ok({
+    titles: limit_titles(sort_titles(titles, sort_by), limit),
+    page_contents: None,
+  })
+}
+
+///|
+fn fetch_dump_template_usages(
+  dump_dir : String,
+  template_name : String,
+) -> Result[UsageResults, String] {
+  let temp_path = temporary_dump_matches_path()
+  let command = build_dump_search_command(dump_dir, template_name, temp_path)
+  let status = run_shell_command(command)
+  if status != 0 && !is_no_match_exit_status(status) {
+    ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+    return Err("dump scan failed")
+  }
+  let matches = match read_file_to_string(temp_path) {
+    Ok(matches) => matches
+    Err(message) => {
+      ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+      return Err(message)
+    }
+  }
+  ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+  let (titles, page_contents) = parse_dump_page_matches(matches)
+  Ok({ titles, page_contents: Some(page_contents) })
+}
+
+///|
+fn build_dump_search_command(
+  dump_dir : String,
+  template_name : String,
+  temp_path : String,
+) -> String {
+  let mut command = "rg -z -U -P -o --no-messages --no-filename"
+  command += " -g " + shell_quote("*.xml")
+  command += " -g " + shell_quote("*.xml.bz2")
+  command += " -g " + shell_quote("*.xml.gz")
+  command += " " + shell_quote(build_dump_page_regex(template_name))
+  command += " " + shell_quote(dump_dir)
+  command += " > " + shell_quote(temp_path)
+  command
+}
+
+///|
+fn build_dump_page_regex(template_name : String) -> String {
+  "(?is)<page>.*?\\{\\{\\s*(?:subst:|safesubst:)?(?:template:)?\\s*" +
+  escape_template_name_for_regex(normalize_template_target(template_name)) +
+  "(?=[\\s|}]).*?</page>"
+}
+
+///|
+fn escape_template_name_for_regex(template_name : String) -> String {
+  let mut escaped = ""
+  for i = 0; i < template_name.length(); i = i + 1 {
+    let code = template_name.code_unit_at(i).to_int()
+    match code {
+      32 | 95 => escaped += "[ _]+"
+      36
+      | 40
+      | 41
+      | 42
+      | 43
+      | 45
+      | 46
+      | 63
+      | 91
+      | 92
+      | 93
+      | 94
+      | 123
+      | 124
+      | 125 => {
+        escaped += "\\"
+        escaped += template_name[i:i + 1].to_string()
+      }
+      _ => escaped += template_name[i:i + 1].to_string()
+    }
+  }
+  escaped
+}
+
+///|
+fn parse_dump_page_matches(
+  payload : String,
+) -> (Array[String], Map[String, String]) {
+  let titles = []
+  let page_contents = {}
+  for page in extract_xml_page_blocks(payload) {
+    match extract_dump_page_title(page) {
+      Some(title) => {
+        titles.push(title)
+        page_contents[title] = extract_dump_page_content(page)
+      }
+      None => ()
+    }
+  }
+  (titles, page_contents)
+}
+
+///|
+fn extract_xml_page_blocks(payload : String) -> Array[String] {
+  let pages = []
+  let mut search_from = 0
+  while true {
+    let start = find_substring(payload, "<page>", search_from)
+    if start < 0 {
+      break
+    }
+    let end = find_substring(payload, "</page>", start)
+    if end < 0 {
+      break
+    }
+    pages.push(payload[start:end + 7].to_string())
+    search_from = end + 7
+  }
+  pages
+}
+
+///|
+fn extract_dump_page_title(page : String) -> String? {
+  match extract_xml_tag_text(page, "title") {
+    Some(title) => Some(decode_xml_entities(title))
+    None => None
+  }
+}
+
+///|
+fn extract_dump_page_content(page : String) -> String {
+  let text_start = find_substring(page, "<text", 0)
+  if text_start < 0 {
+    return ""
+  }
+  let body_start = find_substring(page, ">", text_start)
+  if body_start < 0 {
+    return ""
+  }
+  let text_end = find_substring(page, "</text>", body_start + 1)
+  if text_end < 0 {
+    return ""
+  }
+  decode_xml_entities(page[body_start + 1:text_end].to_string())
+}
+
+///|
+fn extract_xml_tag_text(payload : String, tag : String) -> String? {
+  let start_tag = "<" + tag + ">"
+  let end_tag = "</" + tag + ">"
+  let start = find_substring(payload, start_tag, 0)
+  if start < 0 {
+    return None
+  }
+  let content_start = start + start_tag.length()
+  let end = find_substring(payload, end_tag, content_start)
+  if end < 0 {
+    return None
+  }
+  Some(payload[content_start:end].to_string())
+}
+
+///|
+fn find_substring(content : String, needle : String, start : Int) -> Int {
+  let content_len = content.length()
+  let needle_len = needle.length()
+  if needle_len == 0 {
+    return start
+  }
+  if start < 0 || start + needle_len > content_len {
+    return -1
+  }
+  for i = start; i + needle_len <= content_len; i = i + 1 {
+    if starts_with_at(content, needle, i) {
+      return i
+    }
+  }
+  -1
+}
+
+///|
+fn starts_with_at(content : String, needle : String, index : Int) -> Bool {
+  if index < 0 || index + needle.length() > content.length() {
+    return false
+  }
+  for i = 0; i < needle.length(); i = i + 1 {
+    if content.code_unit_at(index + i) != needle.code_unit_at(i) {
+      return false
+    }
+  }
+  true
+}
+
+///|
+fn decode_xml_entities(text : String) -> String {
+  let mut decoded = text
+  while decoded.contains("&lt;") {
+    decoded = decoded.replace(old="&lt;", new="<")
+  }
+  while decoded.contains("&gt;") {
+    decoded = decoded.replace(old="&gt;", new=">")
+  }
+  while decoded.contains("&quot;") {
+    decoded = decoded.replace(old="&quot;", new="\"")
+  }
+  while decoded.contains("&apos;") {
+    decoded = decoded.replace(old="&apos;", new="'")
+  }
+  while decoded.contains("&amp;") {
+    decoded = decoded.replace(old="&amp;", new="&")
+  }
+  decoded
 }
 
 ///|
@@ -835,6 +1084,12 @@ fn temporary_output_path() -> String {
 }
 
 ///|
+fn temporary_dump_matches_path() -> String {
+  let cwd = @env.current_dir().unwrap_or(".")
+  cwd + "/.mediawiki_template_usage_" + @env.now().to_string() + ".xml"
+}
+
+///|
 #cfg(not(platform="windows"))
 fn shell_quote(value : String) -> String {
   "'" + value.replace(old="'", new="'\"'\"'") + "'"
@@ -849,6 +1104,39 @@ fn shell_quote(value : String) -> String {
 ///|
 fn run_shell_command(command : String) -> Int {
   system_ffi(string_to_utf8_bytes(command, true))
+}
+
+///|
+#cfg(not(platform="windows"))
+fn path_is_directory(path : String) -> Bool {
+  if path.is_empty() {
+    return false
+  }
+  run_shell_command("test -d " + shell_quote(path)) == 0
+}
+
+///|
+#cfg(platform="windows")
+fn path_is_directory(path : String) -> Bool {
+  if path.is_empty() {
+    return false
+  }
+  run_shell_command(
+    "if exist " + shell_quote(path + "\\NUL") + " (exit 0) else (exit 1)",
+  ) ==
+  0
+}
+
+///|
+#cfg(not(platform="windows"))
+fn is_no_match_exit_status(status : Int) -> Bool {
+  status == 256
+}
+
+///|
+#cfg(platform="windows")
+fn is_no_match_exit_status(status : Int) -> Bool {
+  status == 1
 }
 
 ///|

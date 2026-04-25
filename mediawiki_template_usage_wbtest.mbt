@@ -47,6 +47,28 @@ test "resolve language project aliases" {
 }
 
 ///|
+test "parse dump page matches extracts titles and content" {
+  let payload =
+    #|<page><title>Page One</title><revision><text xml:space="preserve">{{Citation needed|date=2024}}</text></revision></page>
+    #|<page><title>Page &amp; Two</title><revision><text xml:space="preserve">Before &lt;tag&gt;{{Citation needed}}&lt;/tag&gt;</text></revision></page>
+  let (titles, contents) = parse_dump_page_matches(payload)
+  assert_eq(titles, ["Page One", "Page & Two"])
+  assert_eq(contents.get("Page One"), Some("{{Citation needed|date=2024}}"))
+  assert_eq(
+    contents.get("Page & Two"),
+    Some("Before <tag>{{Citation needed}}</tag>"),
+  )
+}
+
+///|
+test "build dump page regex escapes template variants" {
+  assert_eq(
+    build_dump_page_regex("Template:Citation needed"),
+    "(?is)<page>.*?\\{\\{\\s*(?:subst:|safesubst:)?(?:template:)?\\s*citation[ _]+needed(?=[\\s|}]).*?</page>",
+  )
+}
+
+///|
 test "sort titles by title desc" {
   assert_eq(sort_titles(["Short", "Long", "Medium"], TitleDesc), [
     "Short", "Medium", "Long",
