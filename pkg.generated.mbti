@@ -26,6 +26,7 @@ pub(all) struct Config {
   limit : Int?
   sort_by : SortBy
   show_content : Bool
+  verbose : Bool
 } derive(Eq)
 pub impl Show for Config
 

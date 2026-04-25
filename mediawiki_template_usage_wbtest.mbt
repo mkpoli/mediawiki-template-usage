@@ -22,7 +22,7 @@ test "extract embeddedin response and continue token" {
     #|    ]
     #|  }
     #|}
-  match parse_template_usage_payload(payload, None) {
+  match parse_template_usage_payload(payload, None, false) {
     Ok((titles, Some(token))) => {
       assert_eq(titles, ["Page One", "Page Two"])
       assert_eq(token, "10|Template:Infobox_person")
@@ -53,7 +53,8 @@ test "extract filtered embeddedin response and continue token" {
     #|    ]
     #|  }
     #|}
-  match parse_template_usage_payload(payload, Some("Category:Living people")) {
+  match
+    parse_template_usage_payload(payload, Some("Category:Living people"), false) {
     Ok((titles, Some(token))) => {
       assert_eq(titles, ["Page One"])
       assert_eq(token, "10|Template:Infobox_person")
@@ -154,4 +155,11 @@ test "normalize category name" {
     normalize_category_name("Category:All articles with unsourced statements"),
     "Category:All articles with unsourced statements",
   )
+}
+
+///|
+test "normalize cli args expands verbose alias" {
+  assert_eq(normalize_cli_args(["enwp", "Citation needed", "-v"]), [
+    "enwp", "Citation needed", "--verbose",
+  ])
 }
