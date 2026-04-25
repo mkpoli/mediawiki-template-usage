@@ -22,9 +22,40 @@ test "extract embeddedin response and continue token" {
     #|    ]
     #|  }
     #|}
-  match parse_embeddedin_payload(payload) {
+  match parse_template_usage_payload(payload, None) {
     Ok((titles, Some(token))) => {
       assert_eq(titles, ["Page One", "Page Two"])
+      assert_eq(token, "10|Template:Infobox_person")
+    }
+    _ => panic()
+  }
+}
+
+///|
+test "extract filtered embeddedin response and continue token" {
+  let payload =
+    #|{
+    #|  "continue": { "geicontinue": "10|Template:Infobox_person", "continue": "||" },
+    #|  "query": {
+    #|    "pages": [
+    #|      {
+    #|        "title": "Page One",
+    #|        "categories": [
+    #|          { "title": "Category:Living people" }
+    #|        ]
+    #|      },
+    #|      {
+    #|        "title": "Page Two",
+    #|        "categories": [
+    #|          { "title": "Category:Other" }
+    #|        ]
+    #|      }
+    #|    ]
+    #|  }
+    #|}
+  match parse_template_usage_payload(payload, Some("Category:Living people")) {
+    Ok((titles, Some(token))) => {
+      assert_eq(titles, ["Page One"])
       assert_eq(token, "10|Template:Infobox_person")
     }
     _ => panic()
@@ -113,5 +144,14 @@ test "render page content prefixes title" {
   assert_eq(
     render_page_content("Albert Einstein", ["{{Infobox scientist}}"]),
     "= Albert Einstein =\n{{Infobox scientist}}",
+  )
+}
+
+///|
+test "normalize category name" {
+  assert_eq(normalize_category_name("Living people"), "Category:Living people")
+  assert_eq(
+    normalize_category_name("Category:All articles with unsourced statements"),
+    "Category:All articles with unsourced statements",
   )
 }

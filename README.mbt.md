@@ -34,10 +34,11 @@ After downloading a release archive, run the packaged binary directly:
 ```sh
 ./mediawiki-template-usage <endpoint> <template>
 ./mediawiki-template-usage enwp "Citation needed"
+./mediawiki-template-usage enwp "Citation needed" --category "Living people"
 ./mediawiki-template-usage enwp "Citation needed" --limit 20 --show-content
 ```
 
-Use `./mediawiki-template-usage --help` to see available options such as `--limit`, `--sort-by`, and `--show-content`.
+Use `./mediawiki-template-usage --help` to see available options such as `--limit`, `--sort-by`, `--category`, and `--show-content`.
 
 ### Development
 
@@ -46,7 +47,8 @@ From the project root, run the CLI through MoonBit:
 ```sh
 moon run cmd/main -- <endpoint> <template>
 moon run cmd/main -- enwp "Citation needed"
+moon run cmd/main -- enwp "Citation needed" --category "Living people"
 moon run cmd/main -- enwp "Citation needed" --limit 20 --show-content
 ```
 
-Use `moon run cmd/main -- --help` to see available options such as `--limit`, `--sort-by`, and `--show-content`.
+Use `moon run cmd/main -- --help` to see available options such as `--limit`, `--sort-by`, `--category`, and `--show-content`.

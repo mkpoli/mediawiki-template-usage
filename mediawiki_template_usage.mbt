@@ -31,6 +31,7 @@ pub impl Show for SortBy with output(self, logger) {
 pub(all) struct Config {
   endpoint : String
   template_name : String
+  category_name : String?
   limit : Int?
   sort_by : SortBy
   show_content : Bool
@@ -42,6 +43,8 @@ pub impl Show for Config with output(self, logger) {
   logger.write_object(self.endpoint)
   logger.write_string(", template_name: ")
   logger.write_object(self.template_name)
+  logger.write_string(", category_name: ")
+  logger.write_object(self.category_name)
   logger.write_string(", limit: ")
   logger.write_object(self.limit)
   logger.write_string(", sort_by: ")
@@ -93,6 +96,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
       fetch_all_template_usages(
         config.endpoint,
         config.template_name,
+        config.category_name,
         config.sort_by,
         config.limit,
       ) {
@@ -114,7 +118,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template via the embeddedin API.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    about="List pages that transclude a MediaWiki template via the embeddedin API.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
     version="0.1.2",
     arg_required_else_help=true,
     flags=[
@@ -135,6 +139,11 @@ pub fn command() -> @argparse.Command {
         short='s',
         about="Sort order: api, title-asc, or title-desc.",
         default_values=["api"],
+      ),
+      @argparse.OptionArg::new(
+        "category",
+        short='c',
+        about="Only include pages that are in the given category, with or without the Category: prefix.",
       ),
     ],
     positionals=[
@@ -165,6 +174,10 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     raise Message("missing template argument")
   }
   let endpoint = resolve_endpoint(raw_endpoint)
+  let category_name = match values.get("category") {
+    Some([raw_category, ..]) => Some(normalize_category_name(raw_category))
+    _ => None
+  }
   let limit = match values.get("limit") {
     Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
     _ => Some(10)
@@ -174,7 +187,7 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     _ => Api
   }
   let show_content = matches.flags.get_or_default("show-content", false)
-  { endpoint, template_name, limit, sort_by, show_content }
+  { endpoint, template_name, category_name, limit, sort_by, show_content }
 }
 
 ///|
@@ -328,6 +341,7 @@ fn copy_args_from(args : Array[String], start : Int) -> Array[String] {
 fn fetch_all_template_usages(
   endpoint : String,
   template_name : String,
+  category_name : String?,
   sort_by : SortBy,
   limit : Int?,
 ) -> Result[Array[String], String] {
@@ -335,6 +349,7 @@ fn fetch_all_template_usages(
     fetch_all_template_usage_titles(
       endpoint,
       normalize_template_name(template_name),
+      category_name,
       None,
       [],
     ) {
@@ -348,15 +363,19 @@ fn fetch_all_template_usages(
 fn fetch_all_template_usage_titles(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
   acc : Array[String],
 ) -> Result[Array[String], String] {
   let payload = match
-    fetch_embeddedin_page(endpoint, template_title, continue_token) {
+    fetch_template_usage_page(
+      endpoint, template_title, category_name, continue_token,
+    ) {
     Ok(payload) => payload
     Err(message) => return Err(message)
   }
-  let (titles, next_token) = match parse_embeddedin_payload(payload) {
+  let (titles, next_token) = match
+    parse_template_usage_payload(payload, category_name) {
     Ok(result) => result
     Err(message) => return Err(message)
   }
@@ -368,6 +387,7 @@ fn fetch_all_template_usage_titles(
       fetch_all_template_usage_titles(
         endpoint,
         template_title,
+        category_name,
         Some(token),
         acc,
       )
@@ -721,14 +741,15 @@ fn is_double_close_brace(content : String, index : Int) -> Bool {
 }
 
 ///|
-fn fetch_embeddedin_page(
+fn fetch_template_usage_page(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
 ) -> Result[String, String] {
   let temp_path = temporary_output_path()
-  let command = build_curl_command(
-    endpoint, template_title, continue_token, temp_path,
+  let command = build_template_usage_command(
+    endpoint, template_title, category_name, continue_token, temp_path,
   )
   let status = run_shell_command(command)
   if status != 0 {
@@ -741,9 +762,10 @@ fn fetch_embeddedin_page(
 }
 
 ///|
-fn build_curl_command(
+fn build_template_usage_command(
   endpoint : String,
   template_title : String,
+  category_name : String?,
   continue_token : String?,
   temp_path : String,
 ) -> String {
@@ -752,14 +774,34 @@ fn build_curl_command(
     shell_quote("mediawiki-template-usage/0.1 (local MoonBit CLI)")
   command += " --data-urlencode " + shell_quote("action=query")
   command += " --data-urlencode " + shell_quote("format=json")
-  command += " --data-urlencode " + shell_quote("list=embeddedin")
-  command += " --data-urlencode " + shell_quote("eilimit=max")
+  command += " --data-urlencode " + shell_quote("formatversion=2")
   command += " --data-urlencode " + shell_quote("continue=")
-  command += " --data-urlencode " + shell_quote("eititle=" + template_title)
-  match continue_token {
-    Some(token) =>
-      command += " --data-urlencode " + shell_quote("eicontinue=" + token)
-    None => ()
+  match category_name {
+    Some(category_title) => {
+      command += " --data-urlencode " + shell_quote("generator=embeddedin")
+      command += " --data-urlencode " + shell_quote("geilimit=max")
+      command += " --data-urlencode " +
+        shell_quote("geititle=" + template_title)
+      command += " --data-urlencode " + shell_quote("prop=categories")
+      command += " --data-urlencode " + shell_quote("cllimit=max")
+      command += " --data-urlencode " +
+        shell_quote("clcategories=" + category_title)
+      match continue_token {
+        Some(token) =>
+          command += " --data-urlencode " + shell_quote("geicontinue=" + token)
+        None => ()
+      }
+    }
+    None => {
+      command += " --data-urlencode " + shell_quote("list=embeddedin")
+      command += " --data-urlencode " + shell_quote("eilimit=max")
+      command += " --data-urlencode " + shell_quote("eititle=" + template_title)
+      match continue_token {
+        Some(token) =>
+          command += " --data-urlencode " + shell_quote("eicontinue=" + token)
+        None => ()
+      }
+    }
   }
   command += " " + shell_quote(endpoint)
   command += " > " + shell_quote(temp_path)
@@ -767,13 +809,19 @@ fn build_curl_command(
 }
 
 ///|
-fn parse_embeddedin_payload(
+fn parse_template_usage_payload(
   payload : String,
+  category_name : String?,
 ) -> Result[(Array[String], String?), String] {
   let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
   match parsed {
     Err(error) => Err("invalid JSON response: \{error.to_string()}")
-    Ok(json) => extract_embeddedin_response(json)
+    Ok(json) =>
+      match category_name {
+        Some(category_title) =>
+          extract_filtered_embeddedin_response(json, category_title)
+        None => extract_embeddedin_response(json)
+      }
   }
 }
 
@@ -819,12 +867,88 @@ fn extract_embeddedin_response(
 }
 
 ///|
+fn extract_filtered_embeddedin_response(
+  json : Json,
+  category_title : String,
+) -> Result[(Array[String], String?), String] {
+  guard json is Json::Object(root) else {
+    return Err("response root is not an object")
+  }
+
+  let titles = []
+  match root.get("query") {
+    Some(Json::Object(query)) =>
+      match query.get("pages") {
+        Some(Json::Array(pages)) =>
+          for page in pages {
+            guard page is Json::Object(page_obj) else { continue }
+            guard page_obj.get("title") is Some(Json::String(title)) else {
+              continue
+            }
+            if page_matches_category(page_obj, category_title) {
+              titles.push(title)
+            }
+          }
+        Some(_) => return Err("query.pages is not an array")
+        None => ()
+      }
+    Some(_) => return Err("query is not an object")
+    None => ()
+  }
+
+  let next_token = match root.get("continue") {
+    Some(Json::Object(cont)) =>
+      match cont.get("geicontinue") {
+        Some(Json::String(token)) => Some(token)
+        Some(_) => return Err("continue.geicontinue is not a string")
+        None => None
+      }
+    Some(_) => return Err("continue is not an object")
+    None => None
+  }
+
+  Ok((titles, next_token))
+}
+
+///|
+fn page_matches_category(
+  page_obj : Map[String, Json],
+  category_title : String,
+) -> Bool {
+  match page_obj.get("categories") {
+    Some(Json::Array(categories)) => {
+      for category in categories {
+        guard category is Json::Object(category_obj) else { continue }
+        guard category_obj.get("title") is Some(Json::String(title)) else {
+          continue
+        }
+        if title == category_title {
+          return true
+        }
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
 fn normalize_template_name(template_name : String) -> String {
   let trimmed = template_name.trim().to_string()
   if trimmed.has_prefix("Template:") {
     trimmed
   } else {
     "Template:" + trimmed
+  }
+}
+
+///|
+fn normalize_category_name(category_name : String) -> String {
+  let trimmed = category_name.trim().to_string()
+  if trimmed.has_prefix("Category:") {
+    trimmed
+  } else {
+    "Category:" + trimmed
   }
 }
 
