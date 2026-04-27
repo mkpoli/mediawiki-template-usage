@@ -10,7 +10,7 @@ test "parse config accepts explicit limit" {
   assert_eq(config.endpoint, "https://en.wikipedia.org/w/api.php")
   assert_eq(config.dump_files, [])
   assert_eq(config.template_name, "Citation needed")
-  assert_eq(config.category_name, Some("Category:Living people"))
+  assert_eq(config.category_name, Some("Living people"))
   assert_eq(config.limit, Some(3))
   assert_eq(config.sort_by, @mediawiki_template_usage.TitleAsc)
   assert_eq(config.show_content, true)

@@ -14,6 +14,9 @@ const CONTENT_BATCH_SIZE = 20
 const DUMP_READ_CHUNK_SIZE = 65536
 
 ///|
+const DUMP_PROGRESS_INTERVAL = 1000
+
+///|
 pub(all) enum SortBy {
   Api
   TitleAsc
@@ -67,6 +70,28 @@ pub impl Show for Config with output(self, logger) {
 priv struct UsageResults {
   titles : Array[String]
   page_contents : Map[String, String]?
+  query : QueryContext
+}
+
+///|
+priv struct NamespaceInfo {
+  primary_name : String
+  canonical_name : String?
+  aliases : Array[String]
+}
+
+///|
+priv struct SourceNamespaces {
+  template : NamespaceInfo
+  category : NamespaceInfo
+}
+
+///|
+priv struct QueryContext {
+  template_title : String
+  template_target : String
+  category_title : String?
+  category_target : String?
 }
 
 ///|
@@ -121,7 +146,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
       Ok(results) =>
         output_results(
           config.endpoint,
-          config.template_name,
+          results.query.template_target,
           results.titles,
           results.page_contents,
           config.show_content,
@@ -168,7 +193,7 @@ pub fn command() -> @argparse.Command {
       @argparse.OptionArg::new(
         "category",
         short='c',
-        about="Only include pages that are in the given category, with or without the Category: prefix.",
+        about="Only include pages that are in the given category, with or without the source wiki's category prefix.",
       ),
       @argparse.OptionArg::new(
         "dump-file",
@@ -184,7 +209,7 @@ pub fn command() -> @argparse.Command {
       ),
       @argparse.PositionArg::new(
         "template",
-        about="Template name, with or without the Template: prefix",
+        about="Template name, with or without the source wiki's template prefix",
         num_args=@argparse.ValueRange::single(),
       ),
     ],
@@ -208,7 +233,7 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
   )
   let (endpoint, dump_files) = resolve_source(raw_endpoint, extra_dump_files)
   let category_name = match values.get("category") {
-    Some([raw_category, ..]) => Some(normalize_category_name(raw_category))
+    Some([raw_category, ..]) => Some(raw_category.trim().to_string())
     _ => None
   }
   let limit = match values.get("limit") {
@@ -250,7 +275,7 @@ pub fn remove_file_for_test(path : String) -> Unit {
 ///|
 fn output_results(
   endpoint : String,
-  template_name : String,
+  template_target : String,
   titles : Array[String],
   page_contents : Map[String, String]?,
   show_content : Bool,
@@ -270,7 +295,7 @@ fn output_results(
   match page_contents {
     Some(contents) => {
       debug_log(verbose, "using page contents extracted from dump matches")
-      print_page_contents(titles, template_name, contents)
+      print_page_contents(titles, template_target, contents)
     }
     None => {
       debug_log(
@@ -278,7 +303,7 @@ fn output_results(
         "fetching page contents in batches of " + CONTENT_BATCH_SIZE.to_string(),
       )
       match fetch_page_contents(endpoint, titles) {
-        Ok(contents) => print_page_contents(titles, template_name, contents)
+        Ok(contents) => print_page_contents(titles, template_target, contents)
         Err(message) => println("error: \{message}")
       }
     }
@@ -517,21 +542,24 @@ fn fetch_all_template_usages(
   limit : Int?,
   verbose : Bool,
 ) -> Result[UsageResults, String] {
-  let normalized_template = normalize_template_name(template_name)
-  let category_suffix = match category_name {
+  let namespaces = match load_source_namespaces(endpoint, dump_files, verbose) {
+    Ok(namespaces) => namespaces
+    Err(message) => return Err(message)
+  }
+  let query = build_query_context(template_name, category_name, namespaces)
+  let category_suffix = match query.category_title {
     Some(category) => " in " + category
     None => " without category filter"
   }
   debug_log(
     verbose,
-    "fetching usages for " + normalized_template + category_suffix,
+    "fetching usages for " + query.template_title + category_suffix,
   )
   if dump_files.length() > 0 {
     let results = match
       fetch_dump_template_usages(
         dump_files,
-        template_name,
-        category_name,
+        query,
         dump_scan_limit(sort_by, limit),
         verbose,
       ) {
@@ -554,17 +582,10 @@ fn fetch_all_template_usages(
       sort_by.to_string() +
       limit_suffix,
     )
-    return Ok({ titles: limited, page_contents: results.page_contents })
+    return Ok({ titles: limited, page_contents: results.page_contents, query })
   }
   let titles = match
-    fetch_all_template_usage_titles(
-      endpoint,
-      normalized_template,
-      category_name,
-      None,
-      [],
-      verbose,
-    ) {
+    fetch_all_template_usage_titles(endpoint, query, None, [], verbose) {
     Ok(titles) => titles
     Err(message) => return Err(message)
   }
@@ -584,14 +605,13 @@ fn fetch_all_template_usages(
     sort_by.to_string() +
     limit_suffix,
   )
-  Ok({ titles: limited, page_contents: None })
+  Ok({ titles: limited, page_contents: None, query })
 }
 
 ///|
 fn fetch_dump_template_usages(
   dump_files : Array[String],
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
   stop_after : Int?,
   verbose : Bool,
 ) -> Result[UsageResults, String] {
@@ -601,42 +621,45 @@ fn fetch_dump_template_usages(
     dump_files.length().to_string() +
     " dump file(s) for template matches",
   )
-  let (titles, page_contents) = match
-    collect_dump_template_usages(
-      dump_files, template_name, category_name, stop_after,
-    ) {
+  let (titles, page_contents, pages_scanned) = match
+    collect_dump_template_usages(dump_files, query, stop_after, verbose) {
     Ok(parsed) => parsed
     Err(message) => return Err(message)
   }
   debug_log(
     verbose,
-    "parsed " + titles.length().to_string() + " dump pages after filtering",
+    "scanned " +
+    pages_scanned.to_string() +
+    " dump pages; found " +
+    titles.length().to_string() +
+    " matches after filtering",
   )
-  Ok({ titles, page_contents: Some(page_contents) })
+  Ok({ titles, page_contents: Some(page_contents), query })
 }
 
 ///|
 fn collect_dump_template_usages(
   dump_files : Array[String],
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
   stop_after : Int?,
-) -> Result[(Array[String], Map[String, String]), String] {
+  verbose : Bool,
+) -> Result[(Array[String], Map[String, String], Int), String] {
   let titles = []
   let page_contents = {}
+  let mut pages_scanned = 0
   for dump_file in dump_files {
     let scan_result = scan_dump_file(
-      dump_file, template_name, category_name, titles, page_contents, stop_after,
+      dump_file, query, titles, page_contents, stop_after, verbose,
     )
     match scan_result {
-      Ok(_) => ()
+      Ok(scanned) => pages_scanned += scanned
       Err(message) => return Err(message)
     }
     if reached_dump_scan_limit(titles.length(), stop_after) {
       break
     }
   }
-  Ok((titles, page_contents))
+  Ok((titles, page_contents, pages_scanned))
 }
 
 ///|
@@ -658,18 +681,20 @@ fn reached_dump_scan_limit(count : Int, stop_after : Int?) -> Bool {
 ///|
 fn scan_dump_file(
   dump_file : String,
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
   titles : Array[String],
   page_contents : Map[String, String],
   stop_after : Int?,
-) -> Result[Unit, String] {
+  verbose : Bool,
+) -> Result[Int, String] {
   let fd = open_ffi(string_to_utf8_bytes(dump_file, true), O_RDONLY, 0)
   if fd < 0 {
     return Err("failed to open dump file")
   }
   let buffer = Bytes::new(DUMP_READ_CHUNK_SIZE)
   let pending : Array[Byte] = []
+  let mut pages_scanned = 0
+  let mut next_progress = DUMP_PROGRESS_INTERVAL
   while true {
     let bytes_read = read_ffi(fd, buffer, DUMP_READ_CHUNK_SIZE)
     if bytes_read < 0 {
@@ -680,15 +705,31 @@ fn scan_dump_file(
       break
     }
     append_bytes_from_buffer(pending, buffer, bytes_read)
-    process_pending_dump_pages(
-      pending, template_name, category_name, titles, page_contents, stop_after,
+    pages_scanned += process_pending_dump_pages(
+      pending, query, titles, page_contents, stop_after,
     )
+    while should_log_dump_progress(pages_scanned, next_progress) {
+      debug_log(
+        verbose,
+        "processed " +
+        pages_scanned.to_string() +
+        " dump pages; found " +
+        titles.length().to_string() +
+        " matches",
+      )
+      next_progress += DUMP_PROGRESS_INTERVAL
+    }
     if reached_dump_scan_limit(titles.length(), stop_after) {
       break
     }
   }
   ignore(close_ffi(fd))
-  Ok(())
+  Ok(pages_scanned)
+}
+
+///|
+fn should_log_dump_progress(pages_scanned : Int, next_progress : Int) -> Bool {
+  pages_scanned >= next_progress
 }
 
 ///|
@@ -705,14 +746,14 @@ fn append_bytes_from_buffer(
 ///|
 fn process_pending_dump_pages(
   pending : Array[Byte],
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
   titles : Array[String],
   page_contents : Map[String, String],
   stop_after : Int?,
-) -> Unit {
+) -> Int {
   let page_start = string_to_utf8_bytes("<page", false).to_array()
   let page_end = string_to_utf8_bytes("</page>", false).to_array()
+  let mut processed = 0
   while true {
     let start = find_byte_substring(pending, page_start, 0)
     if start < 0 {
@@ -729,21 +770,20 @@ fn process_pending_dump_pages(
     let page_xml = utf8_bytes_to_string(
       Bytes::from_array(copy_byte_range(pending, 0, end + page_end.length())),
     )
-    process_dump_page_xml(
-      page_xml, template_name, category_name, titles, page_contents,
-    )
+    process_dump_page_xml(page_xml, query, titles, page_contents)
+    processed += 1
     drop_pending_prefix(pending, end + page_end.length())
     if reached_dump_scan_limit(titles.length(), stop_after) {
       break
     }
   }
+  processed
 }
 
 ///|
 fn process_dump_page_xml(
   page_xml : String,
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
   titles : Array[String],
   page_contents : Map[String, String],
 ) -> Unit {
@@ -751,10 +791,10 @@ fn process_dump_page_xml(
     Some(page) => page
     None => return
   }
-  if !page_contains_template(page.content, template_name) {
+  if !page_contains_template(page.content, query.template_target) {
     return
   }
-  if !dump_page_matches_category(page.content, category_name) {
+  if !dump_page_matches_category(page.content, query.category_target) {
     return
   }
   titles.push(page.title)
@@ -846,15 +886,12 @@ fn has_byte_substring_at(
 ///|
 fn parse_dump_xml(
   payload : String,
-  template_name : String,
-  category_name : String?,
+  query : QueryContext,
 ) -> Result[(Array[String], Map[String, String]), String] {
   let titles = []
   let page_contents = {}
   for page_xml in split_dump_pages(payload) {
-    process_dump_page_xml(
-      page_xml, template_name, category_name, titles, page_contents,
-    )
+    process_dump_page_xml(page_xml, query, titles, page_contents)
   }
   Ok((titles, page_contents))
 }
@@ -988,24 +1025,26 @@ fn decode_xml_entities(text : String) -> String {
 }
 
 ///|
-fn page_contains_template(content : String, template_name : String) -> Bool {
-  extract_template_usages(content, template_name).length() > 0
+fn page_contains_template(content : String, template_target : String) -> Bool {
+  extract_template_usages(content, template_target).length() > 0
 }
 
 ///|
 fn dump_page_matches_category(
   content : String,
-  category_name : String?,
+  category_target : String?,
 ) -> Bool {
-  match category_name {
-    Some(category_title) => content_has_category_link(content, category_title)
+  match category_target {
+    Some(category) => content_has_category_link(content, category)
     None => true
   }
 }
 
 ///|
-fn content_has_category_link(content : String, category_title : String) -> Bool {
-  let normalized_category = normalize_category_target(category_title)
+fn content_has_category_link(
+  content : String,
+  category_target : String,
+) -> Bool {
   let len = content.length()
   let mut i = 0
   while i + 1 < len {
@@ -1013,8 +1052,8 @@ fn content_has_category_link(content : String, category_title : String) -> Bool 
       let end = find_wikilink_end(content, i)
       if end > i {
         let snippet = content[i:end].to_string()
-        if normalize_category_target(extract_wikilink_target(snippet)) ==
-          normalized_category {
+        if normalize_namespace_target(extract_wikilink_target(snippet)) ==
+          category_target {
           return true
         }
         i = end
@@ -1049,21 +1088,19 @@ fn find_wikilink_end(content : String, start : Int) -> Int {
 }
 
 ///|
-fn normalize_category_target(category_name : String) -> String {
-  let normalized = category_name.replace(old="_", new=" ").trim().to_string()
-  let lowered = normalized.to_lower()
-  if lowered.has_prefix("category:") {
-    lowered[9:].trim().to_string()
-  } else {
-    lowered
+fn normalize_namespace_target(name : String) -> String {
+  let normalized = name.replace(old="_", new=" ").trim().to_string()
+  let segments = normalized.split(":").to_array()
+  if segments.length() <= 1 {
+    return normalized.to_lower()
   }
+  segments[1:].join(":").trim().to_string().to_lower()
 }
 
 ///|
 fn fetch_all_template_usage_titles(
   endpoint : String,
-  template_title : String,
-  category_name : String?,
+  query : QueryContext,
   continue_token : String?,
   acc : Array[String],
   verbose : Bool,
@@ -1074,14 +1111,12 @@ fn fetch_all_template_usage_titles(
   }
   debug_log(verbose, "requesting usage page" + continue_suffix)
   let payload = match
-    fetch_template_usage_page(
-      endpoint, template_title, category_name, continue_token, verbose,
-    ) {
+    fetch_template_usage_page(endpoint, query, continue_token, verbose) {
     Ok(payload) => payload
     Err(message) => return Err(message)
   }
   let (titles, next_token) = match
-    parse_template_usage_payload(payload, category_name, verbose) {
+    parse_template_usage_payload(payload, query.category_target, verbose) {
     Ok(result) => result
     Err(message) => return Err(message)
   }
@@ -1103,8 +1138,7 @@ fn fetch_all_template_usage_titles(
     Some(token) =>
       fetch_all_template_usage_titles(
         endpoint,
-        template_title,
-        category_name,
+        query,
         Some(token),
         acc,
         verbose,
@@ -1362,10 +1396,9 @@ fn render_page_content(title : String, snippets : Array[String]) -> String {
 ///|
 fn extract_template_usages(
   content : String,
-  template_name : String,
+  template_target : String,
 ) -> Array[String] {
   let snippets = []
-  let normalized_template = normalize_template_target(template_name)
   let len = content.length()
   let mut i = 0
   while i + 1 < len {
@@ -1373,8 +1406,8 @@ fn extract_template_usages(
       let end = find_transclusion_end(content, i)
       if end > i {
         let snippet = content[i:end].to_string()
-        if normalize_template_target(extract_transclusion_target(snippet)) ==
-          normalized_template {
+        if normalize_namespace_target(extract_transclusion_target(snippet)) ==
+          template_target {
           snippets.push(snippet)
         }
         i = end
@@ -1407,19 +1440,6 @@ fn strip_transclusion_prefixes(target : String) -> String {
     return strip_transclusion_prefixes(normalized[10:].to_string())
   }
   normalized
-}
-
-///|
-fn normalize_template_target(template_name : String) -> String {
-  let normalized = strip_transclusion_prefixes(
-    template_name.replace(old="_", new=" ").trim().to_string(),
-  )
-  let lowered = normalized.to_lower()
-  if lowered.has_prefix("template:") {
-    lowered[9:].trim().to_string()
-  } else {
-    lowered
-  }
 }
 
 ///|
@@ -1473,20 +1493,22 @@ fn is_double_close_bracket(content : String, index : Int) -> Bool {
 ///|
 fn fetch_template_usage_page(
   endpoint : String,
-  template_title : String,
-  category_name : String?,
+  query : QueryContext,
   continue_token : String?,
   verbose : Bool,
 ) -> Result[String, String] {
   let temp_path = temporary_output_path()
   let command = build_template_usage_command(
-    endpoint, template_title, category_name, continue_token, temp_path,
+    endpoint, query, continue_token, temp_path,
   )
   debug_log(
     verbose,
     "running request: " +
     describe_template_usage_request(
-      endpoint, template_title, category_name, continue_token,
+      endpoint,
+      query.template_title,
+      query.category_title,
+      continue_token,
     ),
   )
   let status = run_shell_command(command)
@@ -1515,8 +1537,7 @@ fn fetch_template_usage_page(
 ///|
 fn build_template_usage_command(
   endpoint : String,
-  template_title : String,
-  category_name : String?,
+  query : QueryContext,
   continue_token : String?,
   temp_path : String,
 ) -> String {
@@ -1527,12 +1548,12 @@ fn build_template_usage_command(
   command += " --data-urlencode " + shell_quote("format=json")
   command += " --data-urlencode " + shell_quote("formatversion=2")
   command += " --data-urlencode " + shell_quote("continue=")
-  match category_name {
+  match query.category_title {
     Some(category_title) => {
       command += " --data-urlencode " + shell_quote("generator=embeddedin")
       command += " --data-urlencode " + shell_quote("geilimit=max")
       command += " --data-urlencode " +
-        shell_quote("geititle=" + template_title)
+        shell_quote("geititle=" + query.template_title)
       command += " --data-urlencode " + shell_quote("prop=categories")
       command += " --data-urlencode " + shell_quote("cllimit=max")
       command += " --data-urlencode " +
@@ -1546,7 +1567,8 @@ fn build_template_usage_command(
     None => {
       command += " --data-urlencode " + shell_quote("list=embeddedin")
       command += " --data-urlencode " + shell_quote("eilimit=max")
-      command += " --data-urlencode " + shell_quote("eititle=" + template_title)
+      command += " --data-urlencode " +
+        shell_quote("eititle=" + query.template_title)
       match continue_token {
         Some(token) =>
           command += " --data-urlencode " + shell_quote("eicontinue=" + token)
@@ -1562,7 +1584,7 @@ fn build_template_usage_command(
 ///|
 fn parse_template_usage_payload(
   payload : String,
-  category_name : String?,
+  category_target : String?,
   verbose : Bool,
 ) -> Result[(Array[String], String?), String] {
   let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
@@ -1575,9 +1597,9 @@ fn parse_template_usage_payload(
       Err("invalid JSON response: \{error.to_string()}")
     }
     Ok(json) =>
-      match category_name {
-        Some(category_title) =>
-          extract_filtered_embeddedin_response(json, category_title, verbose)
+      match category_target {
+        Some(category) =>
+          extract_filtered_embeddedin_response(json, category, verbose)
         None => extract_embeddedin_response(json)
       }
   }
@@ -1627,7 +1649,7 @@ fn extract_embeddedin_response(
 ///|
 fn extract_filtered_embeddedin_response(
   json : Json,
-  category_title : String,
+  category_target : String,
   verbose : Bool,
 ) -> Result[(Array[String], String?), String] {
   guard json is Json::Object(root) else {
@@ -1650,7 +1672,7 @@ fn extract_filtered_embeddedin_response(
             if page_obj.get("categories") is Some(Json::Array(_)) {
               categorized_page_count += 1
             }
-            if page_matches_category(page_obj, category_title) {
+            if page_matches_category(page_obj, category_target) {
               titles.push(title)
             }
           }
@@ -1725,7 +1747,7 @@ fn debug_log(verbose : Bool, message : String) -> Unit {
 ///|
 fn page_matches_category(
   page_obj : Map[String, Json],
-  category_title : String,
+  category_target : String,
 ) -> Bool {
   match page_obj.get("categories") {
     Some(Json::Array(categories)) => {
@@ -1734,7 +1756,7 @@ fn page_matches_category(
         guard category_obj.get("title") is Some(Json::String(title)) else {
           continue
         }
-        if title == category_title {
+        if normalize_namespace_target(title) == category_target {
           return true
         }
       }
@@ -1745,23 +1767,366 @@ fn page_matches_category(
 }
 
 ///|
-fn normalize_template_name(template_name : String) -> String {
-  let trimmed = template_name.trim().to_string()
-  if trimmed.has_prefix("Template:") {
-    trimmed
-  } else {
-    "Template:" + trimmed
+fn load_source_namespaces(
+  endpoint : String,
+  dump_files : Array[String],
+  verbose : Bool,
+) -> Result[SourceNamespaces, String] {
+  if dump_files.length() > 0 {
+    return load_dump_namespaces(dump_files[0])
+  }
+  load_api_namespaces(endpoint, verbose)
+}
+
+///|
+fn build_query_context(
+  raw_template_name : String,
+  raw_category_name : String?,
+  namespaces : SourceNamespaces,
+) -> QueryContext {
+  let template_title = normalize_namespace_title(
+    raw_template_name,
+    namespaces.template,
+  )
+  let category_title = match raw_category_name {
+    Some(category) =>
+      Some(normalize_namespace_title(category, namespaces.category))
+    None => None
+  }
+  let category_target = match category_title {
+    Some(category) => Some(normalize_namespace_target(category))
+    None => None
+  }
+  {
+    template_title,
+    template_target: normalize_namespace_target(template_title),
+    category_title,
+    category_target,
   }
 }
 
 ///|
-fn normalize_category_name(category_name : String) -> String {
-  let trimmed = category_name.trim().to_string()
-  if trimmed.has_prefix("Category:") {
-    trimmed
-  } else {
-    "Category:" + trimmed
+fn normalize_template_name(
+  template_name : String,
+  namespace_info : NamespaceInfo,
+) -> String {
+  normalize_namespace_title(template_name, namespace_info)
+}
+
+///|
+fn normalize_category_name(
+  category_name : String,
+  namespace_info : NamespaceInfo,
+) -> String {
+  normalize_namespace_title(category_name, namespace_info)
+}
+
+///|
+fn normalize_namespace_title(
+  name : String,
+  namespace_info : NamespaceInfo,
+) -> String {
+  let trimmed = name.trim().to_string()
+  if trimmed.is_empty() {
+    return namespace_info.primary_name + ":"
   }
+  match strip_known_namespace_prefix(trimmed, namespace_info) {
+    Some(remainder) => namespace_info.primary_name + ":" + remainder
+    None => namespace_info.primary_name + ":" + trimmed
+  }
+}
+
+///|
+fn strip_known_namespace_prefix(
+  name : String,
+  namespace_info : NamespaceInfo,
+) -> String? {
+  let prefixes = namespace_prefixes(namespace_info)
+  let normalized = name.replace(old="_", new=" ").trim().to_string()
+  for prefix in prefixes {
+    let marker = prefix + ":"
+    if normalized.has_prefix(marker) {
+      return Some(normalized[marker.length():].trim().to_string())
+    }
+  }
+  None
+}
+
+///|
+fn namespace_prefixes(namespace_info : NamespaceInfo) -> Array[String] {
+  let prefixes = [namespace_info.primary_name]
+  match namespace_info.canonical_name {
+    Some(canonical) => push_unique_string(prefixes, canonical)
+    None => ()
+  }
+  for alias_name in namespace_info.aliases {
+    push_unique_string(prefixes, alias_name)
+  }
+  prefixes
+}
+
+///|
+fn push_unique_string(values : Array[String], value : String) -> Unit {
+  for existing in values {
+    if existing == value {
+      return
+    }
+  }
+  values.push(value)
+}
+
+///|
+fn load_api_namespaces(
+  endpoint : String,
+  verbose : Bool,
+) -> Result[SourceNamespaces, String] {
+  let payload = match fetch_siteinfo_payload(endpoint, verbose) {
+    Ok(payload) => payload
+    Err(message) => return Err(message)
+  }
+  parse_api_namespaces_payload(payload)
+}
+
+///|
+fn fetch_siteinfo_payload(
+  endpoint : String,
+  verbose : Bool,
+) -> Result[String, String] {
+  let temp_path = temporary_output_path()
+  let command = build_siteinfo_command(endpoint, temp_path)
+  debug_log(verbose, "requesting siteinfo namespaces from " + endpoint)
+  let status = run_shell_command(command)
+  if shell_exit_code(status) != 0 {
+    ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+    return Err("curl request failed")
+  }
+  let contents = read_file_to_string(temp_path)
+  ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
+  contents
+}
+
+///|
+fn build_siteinfo_command(endpoint : String, temp_path : String) -> String {
+  let mut command = "curl --silent --show-error --fail --get"
+  command += " --user-agent " +
+    shell_quote("mediawiki-template-usage/0.1 (local MoonBit CLI)")
+  command += " --data-urlencode " + shell_quote("action=query")
+  command += " --data-urlencode " + shell_quote("format=json")
+  command += " --data-urlencode " + shell_quote("formatversion=2")
+  command += " --data-urlencode " + shell_quote("meta=siteinfo")
+  command += " --data-urlencode " +
+    shell_quote("siprop=namespaces|namespacealiases")
+  command += " " + shell_quote(endpoint)
+  command += " > " + shell_quote(temp_path)
+  command
+}
+
+///|
+fn parse_api_namespaces_payload(
+  payload : String,
+) -> Result[SourceNamespaces, String] {
+  let parsed : Result[Json, @json.ParseError] = try? @json.parse(payload)
+  match parsed {
+    Err(error) => Err("invalid JSON response: \{error.to_string()}")
+    Ok(json) => extract_api_namespaces(json)
+  }
+}
+
+///|
+fn extract_api_namespaces(json : Json) -> Result[SourceNamespaces, String] {
+  guard json is Json::Object(root) else {
+    return Err("response root is not an object")
+  }
+  guard root.get("query") is Some(Json::Object(query)) else {
+    return Err("query is not an object")
+  }
+  guard query.get("namespaces") is Some(Json::Object(namespaces_obj)) else {
+    return Err("query.namespaces is not an object")
+  }
+  let template = match namespace_info_from_api(namespaces_obj, 10) {
+    Some(info) => info
+    None => return Err("query.namespaces missing namespace 10")
+  }
+  let category = match namespace_info_from_api(namespaces_obj, 14) {
+    Some(info) => info
+    None => return Err("query.namespaces missing namespace 14")
+  }
+  match query.get("namespacealiases") {
+    Some(Json::Array(aliases)) => {
+      apply_namespace_aliases(template, 10, aliases)
+      apply_namespace_aliases(category, 14, aliases)
+    }
+    Some(_) => return Err("query.namespacealiases is not an array")
+    None => ()
+  }
+  Ok({ template, category })
+}
+
+///|
+fn namespace_info_from_api(
+  namespaces_obj : Map[String, Json],
+  id : Int,
+) -> NamespaceInfo? {
+  match namespaces_obj.get(id.to_string()) {
+    Some(Json::Object(namespace_obj)) =>
+      Some(namespace_info_from_json(namespace_obj))
+    _ => None
+  }
+}
+
+///|
+fn namespace_info_from_json(namespace_obj : Map[String, Json]) -> NamespaceInfo {
+  let primary_name = match namespace_obj.get("name") {
+    Some(Json::String(name)) => name
+    _ => ""
+  }
+  let canonical_name = match namespace_obj.get("canonical") {
+    Some(Json::String(name)) => Some(name)
+    _ => None
+  }
+  { primary_name, canonical_name, aliases: [] }
+}
+
+///|
+fn apply_namespace_aliases(
+  namespace_info : NamespaceInfo,
+  id : Int,
+  aliases : Array[Json],
+) -> Unit {
+  let expected_id = id.to_string()
+  for alias_entry in aliases {
+    guard alias_entry is Json::Object(alias_obj) else { continue }
+    let alias_id = match alias_obj.get("id") {
+      Some(Json::Number(number, ..)) => number.to_string()
+      Some(Json::String(text)) => text
+      _ => continue
+    }
+    if alias_id != expected_id {
+      continue
+    }
+    guard alias_obj.get("alias") is Some(Json::String(alias_name)) else {
+      continue
+    }
+    push_unique_string(namespace_info.aliases, alias_name)
+  }
+}
+
+///|
+fn load_dump_namespaces(dump_file : String) -> Result[SourceNamespaces, String] {
+  let payload = match read_dump_siteinfo_section(dump_file) {
+    Ok(payload) => payload
+    Err(message) => return Err(message)
+  }
+  parse_dump_namespaces(payload)
+}
+
+///|
+fn read_dump_siteinfo_section(dump_file : String) -> Result[String, String] {
+  let fd = open_ffi(string_to_utf8_bytes(dump_file, true), O_RDONLY, 0)
+  if fd < 0 {
+    return Err("failed to open dump file")
+  }
+  let buffer = Bytes::new(DUMP_READ_CHUNK_SIZE)
+  let pending : Array[Byte] = []
+  let end_marker = string_to_utf8_bytes("</siteinfo>", false).to_array()
+  while true {
+    let bytes_read = read_ffi(fd, buffer, DUMP_READ_CHUNK_SIZE)
+    if bytes_read < 0 {
+      ignore(close_ffi(fd))
+      return Err("failed to read dump file")
+    }
+    if bytes_read == 0 {
+      break
+    }
+    append_bytes_from_buffer(pending, buffer, bytes_read)
+    let end = find_byte_substring(pending, end_marker, 0)
+    if end >= 0 {
+      ignore(close_ffi(fd))
+      return Ok(
+        utf8_bytes_to_string(
+          Bytes::from_array(
+            copy_byte_range(pending, 0, end + end_marker.length()),
+          ),
+        ),
+      )
+    }
+  }
+  ignore(close_ffi(fd))
+  Err("dump file is missing <siteinfo>")
+}
+
+///|
+fn parse_dump_namespaces(payload : String) -> Result[SourceNamespaces, String] {
+  let siteinfo = extract_siteinfo_xml(payload)
+  guard siteinfo is Some(siteinfo_xml) else {
+    return Err("dump file is missing <siteinfo>")
+  }
+  let template = match extract_dump_namespace_info(siteinfo_xml, 10) {
+    Some(info) => info
+    None => return Err("dump siteinfo missing namespace 10")
+  }
+  let category = match extract_dump_namespace_info(siteinfo_xml, 14) {
+    Some(info) => info
+    None => return Err("dump siteinfo missing namespace 14")
+  }
+  Ok({ template, category })
+}
+
+///|
+fn extract_siteinfo_xml(payload : String) -> String? {
+  let start = find_substring(payload, "<siteinfo>", 0)
+  if start < 0 {
+    return None
+  }
+  let end = find_substring(payload, "</siteinfo>", start)
+  if end < 0 {
+    return None
+  }
+  Some(payload[start:end + 11].to_string())
+}
+
+///|
+fn extract_dump_namespace_info(
+  siteinfo_xml : String,
+  id : Int,
+) -> NamespaceInfo? {
+  let start_tag = "<namespace key=\"" + id.to_string() + "\""
+  let start = find_substring(siteinfo_xml, start_tag, 0)
+  if start < 0 {
+    return None
+  }
+  let open_end = find_substring(siteinfo_xml, ">", start)
+  if open_end < 0 {
+    return None
+  }
+  let end = find_substring(siteinfo_xml, "</namespace>", open_end + 1)
+  if end < 0 {
+    return None
+  }
+  let open_tag = siteinfo_xml[start:open_end + 1].to_string()
+  let body = decode_xml_entities(siteinfo_xml[open_end + 1:end].to_string())
+  let canonical_name = extract_xml_attribute(open_tag, "canonical")
+  let aliases = []
+  match canonical_name {
+    Some(canonical) if canonical != body => aliases.push(canonical)
+    _ => ()
+  }
+  Some({ primary_name: body, canonical_name, aliases })
+}
+
+///|
+fn extract_xml_attribute(tag : String, name : String) -> String? {
+  let marker = name + "=\""
+  let start = find_substring(tag, marker, 0)
+  if start < 0 {
+    return None
+  }
+  let value_start = start + marker.length()
+  let value_end = find_substring(tag, "\"", value_start)
+  if value_end < 0 {
+    return None
+  }
+  Some(decode_xml_entities(tag[value_start:value_end].to_string()))
 }
 
 ///|

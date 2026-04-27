@@ -1,11 +1,22 @@
 ///|
 test "normalize template name" {
+  let namespace_info = {
+    primary_name: "Template",
+    canonical_name: Some("Template"),
+    aliases: ["テンプレート"],
+  }
   assert_eq(
-    normalize_template_name("Infobox person"),
+    normalize_template_name("Infobox person", namespace_info),
     "Template:Infobox person",
   )
   assert_eq(
-    normalize_template_name("Template:Citation needed"),
+    normalize_template_name("Template:Citation needed", namespace_info),
+    "Template:Citation needed",
+  )
+  assert_eq(
+    normalize_template_name(
+      "テンプレート:Citation needed", namespace_info,
+    ),
     "Template:Citation needed",
   )
 }
@@ -53,8 +64,7 @@ test "extract filtered embeddedin response and continue token" {
     #|    ]
     #|  }
     #|}
-  match
-    parse_template_usage_payload(payload, Some("Category:Living people"), false) {
+  match parse_template_usage_payload(payload, Some("living people"), false) {
     Ok((titles, Some(token))) => {
       assert_eq(titles, ["Page One"])
       assert_eq(token, "10|Template:Infobox_person")
@@ -101,6 +111,18 @@ test "split dump pages extracts page fragments" {
 
 ///|
 test "parse dump xml extracts titles and content" {
+  let query = build_query_context("Citation needed", None, {
+    template: {
+      primary_name: "Template",
+      canonical_name: Some("Template"),
+      aliases: [],
+    },
+    category: {
+      primary_name: "Category",
+      canonical_name: Some("Category"),
+      aliases: [],
+    },
+  })
   let payload =
     #|<mediawiki>
     #|  <page>
@@ -112,8 +134,7 @@ test "parse dump xml extracts titles and content" {
     #|    <revision><text>Before &lt;tag&gt;{{Citation needed}}&lt;/tag&gt;</text></revision>
     #|  </page>
     #|</mediawiki>
-  let (titles, contents) = match
-    parse_dump_xml(payload, "Citation needed", None) {
+  let (titles, contents) = match parse_dump_xml(payload, query) {
     Ok(result) => result
     Err(err) => fail(err)
   }
@@ -127,26 +148,41 @@ test "parse dump xml extracts titles and content" {
 
 ///|
 test "parse dump xml applies category filter" {
+  let query = build_query_context(
+    "Citation needed",
+    Some("カテゴリ:Living people"),
+    {
+      template: {
+        primary_name: "Template",
+        canonical_name: Some("Template"),
+        aliases: [],
+      },
+      category: {
+        primary_name: "Category",
+        canonical_name: Some("Category"),
+        aliases: ["カテゴリ"],
+      },
+    },
+  )
   let payload =
     #|<mediawiki>
     #|  <page>
     #|    <title>Page One</title>
-    #|    <revision><text>{{Citation needed}} [[Category:Living people]]</text></revision>
+    #|    <revision><text>{{Citation needed}} [[カテゴリ:Living people]]</text></revision>
     #|  </page>
     #|  <page>
     #|    <title>Page Two</title>
     #|    <revision><text>{{Citation needed}} [[Category:Physics]]</text></revision>
     #|  </page>
     #|</mediawiki>
-  let (titles, contents) = match
-    parse_dump_xml(payload, "Citation needed", Some("Category:Living people")) {
+  let (titles, contents) = match parse_dump_xml(payload, query) {
     Ok(result) => result
     Err(err) => fail(err)
   }
   assert_eq(titles, ["Page One"])
   assert_eq(
     contents.get("Page One"),
-    Some("{{Citation needed}} [[Category:Living people]]"),
+    Some("{{Citation needed}} [[カテゴリ:Living people]]"),
   )
   assert_eq(contents.get("Page Two"), None)
 }
@@ -214,7 +250,7 @@ test "extract page content response" {
 ///|
 test "extract template usages finds matching snippets" {
   let content = "Before\n{{Infobox scientist|name=Albert Einstein}}\nMiddle\n{{Citation needed|date=April 2024}}\nAfter"
-  assert_eq(extract_template_usages(content, "Citation needed"), [
+  assert_eq(extract_template_usages(content, "citation needed"), [
     "{{Citation needed|date=April 2024}}",
   ])
 }
@@ -222,7 +258,7 @@ test "extract template usages finds matching snippets" {
 ///|
 test "extract template usages handles nested templates" {
   let content = "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}"
-  assert_eq(extract_template_usages(content, "Template:Citation needed"), [
+  assert_eq(extract_template_usages(content, "citation needed"), [
     "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}",
   ])
 }
@@ -237,11 +273,95 @@ test "render page content prefixes title" {
 
 ///|
 test "normalize category name" {
-  assert_eq(normalize_category_name("Living people"), "Category:Living people")
+  let namespace_info = {
+    primary_name: "Category",
+    canonical_name: Some("Category"),
+    aliases: ["カテゴリ"],
+  }
   assert_eq(
-    normalize_category_name("Category:All articles with unsourced statements"),
+    normalize_category_name("Living people", namespace_info),
+    "Category:Living people",
+  )
+  assert_eq(
+    normalize_category_name(
+      "Category:All articles with unsourced statements", namespace_info,
+    ),
     "Category:All articles with unsourced statements",
   )
+  assert_eq(
+    normalize_category_name("カテゴリ:アイヌ語", namespace_info),
+    "Category:アイヌ語",
+  )
+}
+
+///|
+test "build query context uses localized aliases" {
+  let query = build_query_context(
+    "テンプレート:Citation needed",
+    Some("カテゴリ:アイヌ語"),
+    {
+      template: {
+        primary_name: "Template",
+        canonical_name: Some("Template"),
+        aliases: ["テンプレート"],
+      },
+      category: {
+        primary_name: "Category",
+        canonical_name: Some("Category"),
+        aliases: ["カテゴリ"],
+      },
+    },
+  )
+  assert_eq(query.template_title, "Template:Citation needed")
+  assert_eq(query.template_target, "citation needed")
+  assert_eq(query.category_title, Some("Category:アイヌ語"))
+  assert_eq(query.category_target, Some("アイヌ語"))
+}
+
+///|
+test "parse api namespaces payload includes aliases" {
+  let payload =
+    #|{
+    #|  "query": {
+    #|    "namespaces": {
+    #|      "10": { "id": 10, "name": "Template", "canonical": "Template" },
+    #|      "14": { "id": 14, "name": "Category", "canonical": "Category" }
+    #|    },
+    #|    "namespacealiases": [
+    #|      { "id": 10, "alias": "テンプレート" },
+    #|      { "id": 14, "alias": "カテゴリ" }
+    #|    ]
+    #|  }
+    #|}
+  let namespaces = match parse_api_namespaces_payload(payload) {
+    Ok(namespaces) => namespaces
+    Err(err) => fail(err)
+  }
+  assert_eq(namespaces.template.aliases, ["テンプレート"])
+  assert_eq(namespaces.category.aliases, ["カテゴリ"])
+}
+
+///|
+test "parse dump namespaces uses siteinfo metadata" {
+  let payload =
+    #|<mediawiki>
+    #|  <siteinfo>
+    #|    <namespaces>
+    #|      <namespace key="10" case="first-letter" canonical="Template">テンプレート</namespace>
+    #|      <namespace key="14" case="first-letter" canonical="Category">カテゴリ</namespace>
+    #|    </namespaces>
+    #|  </siteinfo>
+    #|</mediawiki>
+  let namespaces = match parse_dump_namespaces(payload) {
+    Ok(namespaces) => namespaces
+    Err(err) => fail(err)
+  }
+  assert_eq(namespaces.template.primary_name, "テンプレート")
+  assert_eq(namespaces.template.canonical_name, Some("Template"))
+  assert_eq(namespaces.template.aliases, ["Template"])
+  assert_eq(namespaces.category.primary_name, "カテゴリ")
+  assert_eq(namespaces.category.canonical_name, Some("Category"))
+  assert_eq(namespaces.category.aliases, ["Category"])
 }
 
 ///|
@@ -249,4 +369,11 @@ test "normalize cli args expands verbose alias" {
   assert_eq(normalize_cli_args(["enwp", "Citation needed", "-v"]), [
     "enwp", "Citation needed", "--verbose",
   ])
+}
+
+///|
+test "dump progress logging threshold" {
+  assert_false(should_log_dump_progress(999, 1000))
+  assert_true(should_log_dump_progress(1000, 1000))
+  assert_true(should_log_dump_progress(1250, 1000))
 }
