@@ -1,6 +1,9 @@
 {
   "name": "username/mediawiki_template_usage",
   "version": "0.1.2",
+  "deps": {
+    "moonbitlang/x": "0.4.43"
+  },
   "readme": "README.mbt.md",
   "repository": "",
   "license": "Apache-2.0",

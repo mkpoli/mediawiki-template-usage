@@ -11,6 +11,9 @@ const O_RDONLY = 0
 const CONTENT_BATCH_SIZE = 20
 
 ///|
+const DUMP_READ_CHUNK_SIZE = 65536
+
+///|
 pub(all) enum SortBy {
   Api
   TitleAsc
@@ -30,6 +33,7 @@ pub impl Show for SortBy with output(self, logger) {
 ///|
 pub(all) struct Config {
   endpoint : String
+  dump_files : Array[String]
   template_name : String
   category_name : String?
   limit : Int?
@@ -42,6 +46,8 @@ pub(all) struct Config {
 pub impl Show for Config with output(self, logger) {
   logger.write_string("Config::{ endpoint: ")
   logger.write_object(self.endpoint)
+  logger.write_string(", dump_files: ")
+  logger.write_object(self.dump_files)
   logger.write_string(", template_name: ")
   logger.write_object(self.template_name)
   logger.write_string(", category_name: ")
@@ -105,6 +111,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
     match
       fetch_all_template_usages(
         config.endpoint,
+        config.dump_files,
         config.template_name,
         config.category_name,
         config.sort_by,
@@ -131,7 +138,7 @@ pub fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template from a MediaWiki API or a local Wikimedia dumps folder.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Production (dumps): ./mediawiki-template-usage ./dumps/enwiki \"Citation needed\"\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    about="List pages that transclude a MediaWiki template from a MediaWiki API or local Wikimedia XML dump files.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Production (dump file): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\"\n  Production (multiple dump files): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\" --dump-file jawiktionary-2026-04-01-p7p579549.xml\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
     version="0.1.2",
     arg_required_else_help=true,
     flags=[
@@ -162,11 +169,16 @@ pub fn command() -> @argparse.Command {
         short='c',
         about="Only include pages that are in the given category, with or without the Category: prefix.",
       ),
+      @argparse.OptionArg::new(
+        "dump-file",
+        about="Additional XML dump file to scan. Repeat to combine multiple dump files.",
+        action=@argparse.Append,
+      ),
     ],
     positionals=[
       @argparse.PositionArg::new(
         "source",
-        about="MediaWiki API endpoint, alias, or local dump directory, for example https://en.wikipedia.org/w/api.php, enwp, commons, wikidata, or ./dumps/enwiki",
+        about="MediaWiki API endpoint, alias, or XML dump file, for example https://en.wikipedia.org/w/api.php, enwp, commons, wikidata, or jawiktionary-2026-04-01-p7p579548.xml",
         num_args=@argparse.ValueRange::single(),
       ),
       @argparse.PositionArg::new(
@@ -190,7 +202,10 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
   guard values.get("template") is Some([template_name, ..]) else {
     raise Message("missing template argument")
   }
-  let endpoint = resolve_endpoint(raw_endpoint)
+  let extra_dump_files = resolve_additional_dump_files(
+    values.get("dump-file").unwrap_or([]),
+  )
+  let (endpoint, dump_files) = resolve_source(raw_endpoint, extra_dump_files)
   let category_name = match values.get("category") {
     Some([raw_category, ..]) => Some(normalize_category_name(raw_category))
     _ => None
@@ -207,12 +222,27 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
   let verbose = matches.flags.get_or_default("verbose", false)
   {
     endpoint,
+    dump_files,
     template_name,
     category_name,
     limit,
     sort_by,
     show_content,
     verbose,
+  }
+}
+
+///|
+pub fn write_string_to_file_for_test(path : String, content : String) -> Unit {
+  @fs.write_string_to_file(path, content) catch {
+    _ => panic()
+  }
+}
+
+///|
+pub fn remove_file_for_test(path : String) -> Unit {
+  @fs.remove_file(path) catch {
+    _ => ()
   }
 }
 
@@ -260,21 +290,81 @@ fn resolve_endpoint(raw_endpoint : String) -> String raise CliError {
   if endpoint.contains("://") {
     return endpoint
   }
-  if path_is_directory(endpoint) {
-    return endpoint
-  }
   match endpoint {
     "commons" => "https://commons.wikimedia.org/w/api.php"
     "meta" => "https://meta.wikimedia.org/w/api.php"
     "mediawiki" | "mw" => "https://www.mediawiki.org/w/api.php"
     "wikidata" | "wd" => "https://www.wikidata.org/w/api.php"
     _ => {
-      if looks_like_local_path(endpoint) {
-        raise Message("dump directory '\{endpoint}' does not exist")
+      if path_is_directory(endpoint) {
+        raise Message(
+          "dump directories are not supported; specify one or more dump files instead",
+        )
+      }
+      if looks_like_local_path(endpoint) || looks_like_dump_file_name(endpoint) {
+        raise Message("dump file '\{endpoint}' does not exist")
       }
       resolve_language_project_alias(endpoint)
     }
   }
+}
+
+///|
+fn resolve_source(
+  raw_source : String,
+  extra_dump_files : Array[String],
+) -> (String, Array[String]) raise CliError {
+  let source = raw_source.trim().to_string()
+  if path_is_file(source) {
+    return (source, prepend_dump_file(source, extra_dump_files))
+  }
+  let endpoint = resolve_endpoint(source)
+  if extra_dump_files.length() > 0 {
+    raise Message(
+      "--dump-file can only be used when <source> is also a dump file",
+    )
+  }
+  (endpoint, [])
+}
+
+///|
+fn resolve_additional_dump_files(
+  raw_dump_files : Array[String],
+) -> Array[String] raise CliError {
+  let dump_files = []
+  for raw_dump_file in raw_dump_files {
+    dump_files.push(resolve_dump_file(raw_dump_file))
+  }
+  dump_files
+}
+
+///|
+fn resolve_dump_file(raw_dump_file : String) -> String raise CliError {
+  let dump_file = raw_dump_file.trim().to_string()
+  if !dump_file.has_suffix(".xml") {
+    raise Message("only plain .xml dump files are supported")
+  }
+  if path_is_file(dump_file) {
+    return dump_file
+  }
+  if path_is_directory(dump_file) {
+    raise Message(
+      "dump directories are not supported; specify one or more dump files instead",
+    )
+  }
+  raise Message("dump file '\{dump_file}' does not exist")
+}
+
+///|
+fn prepend_dump_file(
+  dump_file : String,
+  extra_dump_files : Array[String],
+) -> Array[String] {
+  let resolved = [dump_file]
+  for extra_dump_file in extra_dump_files {
+    resolved.push(extra_dump_file)
+  }
+  resolved
 }
 
 ///|
@@ -283,6 +373,11 @@ fn looks_like_local_path(path : String) -> Bool {
   path.contains("\\") ||
   path.has_prefix(".") ||
   path.has_prefix("~")
+}
+
+///|
+fn looks_like_dump_file_name(path : String) -> Bool {
+  path.has_suffix(".xml")
 }
 
 ///|
@@ -336,7 +431,7 @@ fn resolve_language_project_alias(shorthand : String) -> String raise CliError {
     )
   }
   raise Message(
-    "unknown source '\{shorthand}'. Use a full https://.../w/api.php endpoint, an existing dump directory, or a known alias like enwp, commons, meta, mediawiki, or wikidata",
+    "unknown source '\{shorthand}'. Use a full https://.../w/api.php endpoint, an existing dump file, or a known alias like enwp, commons, meta, mediawiki, or wikidata",
   )
 }
 
@@ -414,6 +509,7 @@ fn normalize_cli_args(args : Array[String]) -> Array[String] {
 ///|
 fn fetch_all_template_usages(
   endpoint : String,
+  dump_files : Array[String],
   template_name : String,
   category_name : String?,
   sort_by : SortBy,
@@ -429,10 +525,14 @@ fn fetch_all_template_usages(
     verbose,
     "fetching usages for " + normalized_template + category_suffix,
   )
-  if path_is_directory(endpoint) {
+  if dump_files.length() > 0 {
     let results = match
       fetch_dump_template_usages(
-        endpoint, template_name, category_name, verbose,
+        dump_files,
+        template_name,
+        category_name,
+        dump_scan_limit(sort_by, limit),
+        verbose,
       ) {
       Ok(results) => results
       Err(message) => return Err(message)
@@ -488,32 +588,25 @@ fn fetch_all_template_usages(
 
 ///|
 fn fetch_dump_template_usages(
-  dump_dir : String,
+  dump_files : Array[String],
   template_name : String,
   category_name : String?,
+  stop_after : Int?,
   verbose : Bool,
 ) -> Result[UsageResults, String] {
-  let temp_path = temporary_dump_matches_path()
-  let command = build_dump_search_command(dump_dir, template_name, temp_path)
   debug_log(
     verbose,
-    "scanning dump directory " + dump_dir + " for template matches",
+    "scanning " +
+    dump_files.length().to_string() +
+    " dump file(s) for template matches",
   )
-  let status = run_shell_command(command)
-  if status != 0 && !is_no_match_exit_status(status) {
-    debug_log(verbose, "dump scan exited with status " + status.to_string())
-    ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
-    return Err("dump scan failed")
+  let (titles, page_contents) = match
+    collect_dump_template_usages(
+      dump_files, template_name, category_name, stop_after,
+    ) {
+    Ok(parsed) => parsed
+    Err(message) => return Err(message)
   }
-  let matches = match read_file_to_string(temp_path) {
-    Ok(matches) => matches
-    Err(message) => {
-      ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
-      return Err(message)
-    }
-  }
-  ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
-  let (titles, page_contents) = parse_dump_page_matches(matches, category_name)
   debug_log(
     verbose,
     "parsed " + titles.length().to_string() + " dump pages after filtering",
@@ -522,79 +615,380 @@ fn fetch_dump_template_usages(
 }
 
 ///|
-fn build_dump_search_command(
-  dump_dir : String,
+fn collect_dump_template_usages(
+  dump_files : Array[String],
   template_name : String,
-  temp_path : String,
-) -> String {
-  let mut command = "rg -z -U -P -o --no-messages --no-filename"
-  command += " -g " + shell_quote("*.xml")
-  command += " -g " + shell_quote("*.xml.bz2")
-  command += " -g " + shell_quote("*.xml.gz")
-  command += " " + shell_quote(build_dump_page_regex(template_name))
-  command += " " + shell_quote(dump_dir)
-  command += " > " + shell_quote(temp_path)
-  command
-}
-
-///|
-fn build_dump_page_regex(template_name : String) -> String {
-  "(?is)<page>.*?\\{\\{\\s*(?:subst:|safesubst:)?(?:template:)?\\s*" +
-  escape_template_name_for_regex(normalize_template_target(template_name)) +
-  "(?=[\\s|}]).*?</page>"
-}
-
-///|
-fn escape_template_name_for_regex(template_name : String) -> String {
-  let mut escaped = ""
-  for i = 0; i < template_name.length(); i = i + 1 {
-    let code = template_name.code_unit_at(i).to_int()
-    match code {
-      32 | 95 => escaped += "[ _]+"
-      36
-      | 40
-      | 41
-      | 42
-      | 43
-      | 45
-      | 46
-      | 63
-      | 91
-      | 92
-      | 93
-      | 94
-      | 123
-      | 124
-      | 125 => {
-        escaped += "\\"
-        escaped += template_name[i:i + 1].to_string()
-      }
-      _ => escaped += template_name[i:i + 1].to_string()
-    }
-  }
-  escaped
-}
-
-///|
-fn parse_dump_page_matches(
-  payload : String,
   category_name : String?,
-) -> (Array[String], Map[String, String]) {
+  stop_after : Int?,
+) -> Result[(Array[String], Map[String, String]), String] {
   let titles = []
   let page_contents = {}
-  for page in extract_xml_page_blocks(payload) {
-    match extract_dump_page_title(page) {
-      Some(title) => {
-        let content = extract_dump_page_content(page)
-        if dump_page_matches_category(content, category_name) {
-          titles.push(title)
-          page_contents[title] = content
-        }
-      }
-      None => ()
+  for dump_file in dump_files {
+    let scan_result = scan_dump_file(
+      dump_file, template_name, category_name, titles, page_contents, stop_after,
+    )
+    match scan_result {
+      Ok(_) => ()
+      Err(message) => return Err(message)
+    }
+    if reached_dump_scan_limit(titles.length(), stop_after) {
+      break
     }
   }
-  (titles, page_contents)
+  Ok((titles, page_contents))
+}
+
+///|
+fn dump_scan_limit(sort_by : SortBy, limit : Int?) -> Int? {
+  match sort_by {
+    Api => limit
+    _ => None
+  }
+}
+
+///|
+fn reached_dump_scan_limit(count : Int, stop_after : Int?) -> Bool {
+  match stop_after {
+    Some(limit) => count >= limit
+    None => false
+  }
+}
+
+///|
+fn scan_dump_file(
+  dump_file : String,
+  template_name : String,
+  category_name : String?,
+  titles : Array[String],
+  page_contents : Map[String, String],
+  stop_after : Int?,
+) -> Result[Unit, String] {
+  let fd = open_ffi(string_to_utf8_bytes(dump_file, true), O_RDONLY, 0)
+  if fd < 0 {
+    return Err("failed to open dump file")
+  }
+  let buffer = Bytes::new(DUMP_READ_CHUNK_SIZE)
+  let pending : Array[Byte] = []
+  while true {
+    let bytes_read = read_ffi(fd, buffer, DUMP_READ_CHUNK_SIZE)
+    if bytes_read < 0 {
+      ignore(close_ffi(fd))
+      return Err("failed to read dump file")
+    }
+    if bytes_read == 0 {
+      break
+    }
+    append_bytes_from_buffer(pending, buffer, bytes_read)
+    process_pending_dump_pages(
+      pending, template_name, category_name, titles, page_contents, stop_after,
+    )
+    if reached_dump_scan_limit(titles.length(), stop_after) {
+      break
+    }
+  }
+  ignore(close_ffi(fd))
+  Ok(())
+}
+
+///|
+fn append_bytes_from_buffer(
+  pending : Array[Byte],
+  buffer : Bytes,
+  bytes_read : Int,
+) -> Unit {
+  for i = 0; i < bytes_read; i = i + 1 {
+    pending.push(buffer[i])
+  }
+}
+
+///|
+fn process_pending_dump_pages(
+  pending : Array[Byte],
+  template_name : String,
+  category_name : String?,
+  titles : Array[String],
+  page_contents : Map[String, String],
+  stop_after : Int?,
+) -> Unit {
+  let page_start = string_to_utf8_bytes("<page", false).to_array()
+  let page_end = string_to_utf8_bytes("</page>", false).to_array()
+  while true {
+    let start = find_byte_substring(pending, page_start, 0)
+    if start < 0 {
+      trim_pending_prefix(pending, page_start.length() - 1)
+      break
+    }
+    if start > 0 {
+      drop_pending_prefix(pending, start)
+    }
+    let end = find_byte_substring(pending, page_end, 0)
+    if end < 0 {
+      break
+    }
+    let page_xml = utf8_bytes_to_string(
+      Bytes::from_array(copy_byte_range(pending, 0, end + page_end.length())),
+    )
+    process_dump_page_xml(
+      page_xml, template_name, category_name, titles, page_contents,
+    )
+    drop_pending_prefix(pending, end + page_end.length())
+    if reached_dump_scan_limit(titles.length(), stop_after) {
+      break
+    }
+  }
+}
+
+///|
+fn process_dump_page_xml(
+  page_xml : String,
+  template_name : String,
+  category_name : String?,
+  titles : Array[String],
+  page_contents : Map[String, String],
+) -> Unit {
+  let page = match parse_dump_page(page_xml) {
+    Some(page) => page
+    None => return
+  }
+  if !page_contains_template(page.content, template_name) {
+    return
+  }
+  if !dump_page_matches_category(page.content, category_name) {
+    return
+  }
+  titles.push(page.title)
+  page_contents[page.title] = page.content
+}
+
+///|
+fn trim_pending_prefix(pending : Array[Byte], max_keep : Int) -> Unit {
+  if max_keep <= 0 || pending.length() <= max_keep {
+    return
+  }
+  drop_pending_prefix(pending, pending.length() - max_keep)
+}
+
+///|
+fn drop_pending_prefix(pending : Array[Byte], count : Int) -> Unit {
+  if count <= 0 {
+    return
+  }
+  let keep = copy_byte_range(pending, count, pending.length())
+  pending.clear()
+  for byte in keep {
+    pending.push(byte)
+  }
+}
+
+///|
+fn copy_byte_range(
+  source : Array[Byte],
+  start : Int,
+  stop : Int,
+) -> Array[Byte] {
+  let copied : Array[Byte] = []
+  let bounded_start = if start < 0 { 0 } else { start }
+  let bounded_stop = if stop < source.length() { stop } else { source.length() }
+  for i = bounded_start; i < bounded_stop; i = i + 1 {
+    copied.push(source[i])
+  }
+  copied
+}
+
+///|
+fn find_byte_substring(
+  haystack : Array[Byte],
+  needle : Array[Byte],
+  start : Int,
+) -> Int {
+  let haystack_len = haystack.length()
+  let needle_len = needle.length()
+  if start < 0 || start > haystack_len {
+    return -1
+  }
+  if needle_len == 0 {
+    return start
+  }
+  if needle_len > haystack_len - start {
+    return -1
+  }
+  let last_start = haystack_len - needle_len
+  let mut i = start
+  while i <= last_start {
+    if has_byte_substring_at(haystack, needle, i) {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+///|
+fn has_byte_substring_at(
+  haystack : Array[Byte],
+  needle : Array[Byte],
+  start : Int,
+) -> Bool {
+  let needle_len = needle.length()
+  let mut i = 0
+  while i < needle_len {
+    if haystack[start + i] != needle[i] {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+///|
+
+///|
+fn parse_dump_xml(
+  payload : String,
+  template_name : String,
+  category_name : String?,
+) -> Result[(Array[String], Map[String, String]), String] {
+  let titles = []
+  let page_contents = {}
+  for page_xml in split_dump_pages(payload) {
+    process_dump_page_xml(
+      page_xml, template_name, category_name, titles, page_contents,
+    )
+  }
+  Ok((titles, page_contents))
+}
+
+///|
+priv struct DumpPage {
+  title : String
+  content : String
+}
+
+///|
+fn split_dump_pages(payload : String) -> Array[String] {
+  let pages = []
+  let mut search_from = 0
+  while true {
+    let start = find_substring(payload, "<page", search_from)
+    if start < 0 {
+      break
+    }
+    let start_close = find_substring(payload, ">", start)
+    if start_close < 0 {
+      break
+    }
+    let end = find_substring(payload, "</page>", start_close + 1)
+    if end < 0 {
+      break
+    }
+    pages.push(payload[start:end + 7].to_string())
+    search_from = end + 7
+  }
+  pages
+}
+
+///|
+fn parse_dump_page(page_xml : String) -> DumpPage? {
+  let title = extract_xml_tag_text(page_xml, "title")
+  let content = extract_dump_page_content(page_xml)
+  guard title is Some(title) else { return None }
+  Some({ title, content: content.unwrap_or("") })
+}
+
+///|
+fn extract_xml_tag_text(payload : String, tag : String) -> String? {
+  let start_tag = "<" + tag + ">"
+  let end_tag = "</" + tag + ">"
+  let start = find_substring(payload, start_tag, 0)
+  if start < 0 {
+    return None
+  }
+  let content_start = start + start_tag.length()
+  let end = find_substring(payload, end_tag, content_start)
+  if end < 0 {
+    return None
+  }
+  Some(decode_xml_entities(payload[content_start:end].to_string()))
+}
+
+///|
+fn extract_dump_page_content(page_xml : String) -> String? {
+  let text_start = find_substring(page_xml, "<text", 0)
+  if text_start < 0 {
+    return None
+  }
+  let body_start = find_substring(page_xml, ">", text_start)
+  if body_start < 0 {
+    return None
+  }
+  let text_end = find_substring(page_xml, "</text>", body_start + 1)
+  if text_end < 0 {
+    return None
+  }
+  Some(decode_xml_entities(page_xml[body_start + 1:text_end].to_string()))
+}
+
+///|
+fn find_substring(content : String, needle : String, start : Int) -> Int {
+  let content_len = content.length()
+  let needle_len = needle.length()
+  if start < 0 || start > content_len {
+    return -1
+  }
+  if needle_len == 0 {
+    return start
+  }
+  if needle_len > content_len - start {
+    return -1
+  }
+  let last_start = content_len - needle_len
+  let mut i = start
+  while i <= last_start {
+    if has_substring_at(content, needle, i) {
+      return i
+    }
+    i += 1
+  }
+  -1
+}
+
+///|
+fn has_substring_at(content : String, needle : String, start : Int) -> Bool {
+  let needle_len = needle.length()
+  let mut i = 0
+  while i < needle_len {
+    if content.code_unit_at(start + i) != needle.code_unit_at(i) {
+      return false
+    }
+    i += 1
+  }
+  true
+}
+
+///|
+fn decode_xml_entities(text : String) -> String {
+  let mut decoded = text
+  while decoded.contains("&lt;") {
+    decoded = decoded.replace(old="&lt;", new="<")
+  }
+  while decoded.contains("&gt;") {
+    decoded = decoded.replace(old="&gt;", new=">")
+  }
+  while decoded.contains("&quot;") {
+    decoded = decoded.replace(old="&quot;", new="\"")
+  }
+  while decoded.contains("&apos;") {
+    decoded = decoded.replace(old="&apos;", new="'")
+  }
+  while decoded.contains("&amp;") {
+    decoded = decoded.replace(old="&amp;", new="&")
+  }
+  decoded
+}
+
+///|
+fn page_contains_template(content : String, template_name : String) -> Bool {
+  extract_template_usages(content, template_name).length() > 0
 }
 
 ///|
@@ -662,118 +1056,6 @@ fn normalize_category_target(category_name : String) -> String {
   } else {
     lowered
   }
-}
-
-///|
-fn extract_xml_page_blocks(payload : String) -> Array[String] {
-  let pages = []
-  let mut search_from = 0
-  while true {
-    let start = find_substring(payload, "<page>", search_from)
-    if start < 0 {
-      break
-    }
-    let end = find_substring(payload, "</page>", start)
-    if end < 0 {
-      break
-    }
-    pages.push(payload[start:end + 7].to_string())
-    search_from = end + 7
-  }
-  pages
-}
-
-///|
-fn extract_dump_page_title(page : String) -> String? {
-  match extract_xml_tag_text(page, "title") {
-    Some(title) => Some(decode_xml_entities(title))
-    None => None
-  }
-}
-
-///|
-fn extract_dump_page_content(page : String) -> String {
-  let text_start = find_substring(page, "<text", 0)
-  if text_start < 0 {
-    return ""
-  }
-  let body_start = find_substring(page, ">", text_start)
-  if body_start < 0 {
-    return ""
-  }
-  let text_end = find_substring(page, "</text>", body_start + 1)
-  if text_end < 0 {
-    return ""
-  }
-  decode_xml_entities(page[body_start + 1:text_end].to_string())
-}
-
-///|
-fn extract_xml_tag_text(payload : String, tag : String) -> String? {
-  let start_tag = "<" + tag + ">"
-  let end_tag = "</" + tag + ">"
-  let start = find_substring(payload, start_tag, 0)
-  if start < 0 {
-    return None
-  }
-  let content_start = start + start_tag.length()
-  let end = find_substring(payload, end_tag, content_start)
-  if end < 0 {
-    return None
-  }
-  Some(payload[content_start:end].to_string())
-}
-
-///|
-fn find_substring(content : String, needle : String, start : Int) -> Int {
-  let content_len = content.length()
-  let needle_len = needle.length()
-  if needle_len == 0 {
-    return start
-  }
-  if start < 0 || start + needle_len > content_len {
-    return -1
-  }
-  for i = start; i + needle_len <= content_len; i = i + 1 {
-    if starts_with_at(content, needle, i) {
-      return i
-    }
-  }
-  -1
-}
-
-///|
-fn starts_with_at(content : String, needle : String, index : Int) -> Bool {
-  if index < 0 || index + needle.length() > content.length() {
-    return false
-  }
-  for i = 0; i < needle.length(); i = i + 1 {
-    if content.code_unit_at(index + i) != needle.code_unit_at(i) {
-      return false
-    }
-  }
-  true
-}
-
-///|
-fn decode_xml_entities(text : String) -> String {
-  let mut decoded = text
-  while decoded.contains("&lt;") {
-    decoded = decoded.replace(old="&lt;", new="<")
-  }
-  while decoded.contains("&gt;") {
-    decoded = decoded.replace(old="&gt;", new=">")
-  }
-  while decoded.contains("&quot;") {
-    decoded = decoded.replace(old="&quot;", new="\"")
-  }
-  while decoded.contains("&apos;") {
-    decoded = decoded.replace(old="&apos;", new="'")
-  }
-  while decoded.contains("&amp;") {
-    decoded = decoded.replace(old="&amp;", new="&")
-  }
-  decoded
 }
 
 ///|
@@ -964,7 +1246,7 @@ fn fetch_page_content_batch(
   let temp_path = temporary_output_path()
   let command = build_page_content_command(endpoint, titles, temp_path)
   let status = run_shell_command(command)
-  if status != 0 {
+  if shell_exit_code(status) != 0 {
     ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
     return Err("curl request failed")
   }
@@ -1207,7 +1489,7 @@ fn fetch_template_usage_page(
     ),
   )
   let status = run_shell_command(command)
-  if status != 0 {
+  if shell_exit_code(status) != 0 {
     debug_log(verbose, "curl exited with status " + status.to_string())
     ignore(unlink_ffi(string_to_utf8_bytes(temp_path, true)))
     return Err("curl request failed")
@@ -1488,12 +1770,6 @@ fn temporary_output_path() -> String {
 }
 
 ///|
-fn temporary_dump_matches_path() -> String {
-  let cwd = @env.current_dir().unwrap_or(".")
-  cwd + "/.mediawiki_template_usage_" + @env.now().to_string() + ".xml"
-}
-
-///|
 #cfg(not(platform="windows"))
 fn shell_quote(value : String) -> String {
   "'" + value.replace(old="'", new="'\"'\"'") + "'"
@@ -1512,11 +1788,36 @@ fn run_shell_command(command : String) -> Int {
 
 ///|
 #cfg(not(platform="windows"))
+fn shell_exit_code(status : Int) -> Int {
+  if status < 0 {
+    status
+  } else {
+    status / 256
+  }
+}
+
+///|
+#cfg(platform="windows")
+fn shell_exit_code(status : Int) -> Int {
+  status
+}
+
+///|
+#cfg(not(platform="windows"))
 fn path_is_directory(path : String) -> Bool {
   if path.is_empty() {
     return false
   }
-  run_shell_command("test -d " + shell_quote(path)) == 0
+  shell_exit_code(run_shell_command("test -d " + shell_quote(path))) == 0
+}
+
+///|
+#cfg(not(platform="windows"))
+fn path_is_file(path : String) -> Bool {
+  if path.is_empty() {
+    return false
+  }
+  shell_exit_code(run_shell_command("test -f " + shell_quote(path))) == 0
 }
 
 ///|
@@ -1525,22 +1826,26 @@ fn path_is_directory(path : String) -> Bool {
   if path.is_empty() {
     return false
   }
-  run_shell_command(
-    "if exist " + shell_quote(path + "\\NUL") + " (exit 0) else (exit 1)",
+  shell_exit_code(
+    run_shell_command(
+      "if exist " + shell_quote(path + "\\NUL") + " (exit 0) else (exit 1)",
+    ),
   ) ==
   0
 }
 
 ///|
-#cfg(not(platform="windows"))
-fn is_no_match_exit_status(status : Int) -> Bool {
-  status == 256
-}
-
-///|
 #cfg(platform="windows")
-fn is_no_match_exit_status(status : Int) -> Bool {
-  status == 1
+fn path_is_file(path : String) -> Bool {
+  if path.is_empty() {
+    return false
+  }
+  shell_exit_code(
+    run_shell_command(
+      "if exist " + shell_quote(path) + " (exit 0) else (exit 1)",
+    ),
+  ) ==
+  0
 }
 
 ///|

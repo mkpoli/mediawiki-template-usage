@@ -79,11 +79,44 @@ test "resolve language project aliases" {
 }
 
 ///|
-test "parse dump page matches extracts titles and content" {
+test "prepend dump file keeps source first" {
+  assert_eq(
+    prepend_dump_file("/tmp/jawiktionary-2026-04-01-p7p579548.xml", [
+      "/tmp/jawiktionary-2026-04-01-p7p579549.xml",
+    ]),
+    [
+      "/tmp/jawiktionary-2026-04-01-p7p579548.xml", "/tmp/jawiktionary-2026-04-01-p7p579549.xml",
+    ],
+  )
+}
+
+///|
+test "split dump pages extracts page fragments" {
   let payload =
-    #|<page><title>Page One</title><revision><text xml:space="preserve">{{Citation needed|date=2024}}</text></revision></page>
-    #|<page><title>Page &amp; Two</title><revision><text xml:space="preserve">Before &lt;tag&gt;{{Citation needed}}&lt;/tag&gt;</text></revision></page>
-  let (titles, contents) = parse_dump_page_matches(payload, None)
+    #|<mediawiki><page><title>A</title></page><page><title>B</title></page></mediawiki>
+  assert_eq(split_dump_pages(payload), [
+    "<page><title>A</title></page>", "<page><title>B</title></page>",
+  ])
+}
+
+///|
+test "parse dump xml extracts titles and content" {
+  let payload =
+    #|<mediawiki>
+    #|  <page>
+    #|    <title>Page One</title>
+    #|    <revision><text>{{Citation needed|date=2024}}</text></revision>
+    #|  </page>
+    #|  <page>
+    #|    <title>Page &amp; Two</title>
+    #|    <revision><text>Before &lt;tag&gt;{{Citation needed}}&lt;/tag&gt;</text></revision>
+    #|  </page>
+    #|</mediawiki>
+  let (titles, contents) = match
+    parse_dump_xml(payload, "Citation needed", None) {
+    Ok(result) => result
+    Err(err) => fail(err)
+  }
   assert_eq(titles, ["Page One", "Page & Two"])
   assert_eq(contents.get("Page One"), Some("{{Citation needed|date=2024}}"))
   assert_eq(
@@ -93,14 +126,23 @@ test "parse dump page matches extracts titles and content" {
 }
 
 ///|
-test "parse dump page matches applies category filter" {
+test "parse dump xml applies category filter" {
   let payload =
-    #|<page><title>Page One</title><revision><text xml:space="preserve">{{Citation needed}} [[Category:Living people]]</text></revision></page>
-    #|<page><title>Page Two</title><revision><text xml:space="preserve">{{Citation needed}} [[Category:Physics]]</text></revision></page>
-  let (titles, contents) = parse_dump_page_matches(
-    payload,
-    Some("Category:Living people"),
-  )
+    #|<mediawiki>
+    #|  <page>
+    #|    <title>Page One</title>
+    #|    <revision><text>{{Citation needed}} [[Category:Living people]]</text></revision>
+    #|  </page>
+    #|  <page>
+    #|    <title>Page Two</title>
+    #|    <revision><text>{{Citation needed}} [[Category:Physics]]</text></revision>
+    #|  </page>
+    #|</mediawiki>
+  let (titles, contents) = match
+    parse_dump_xml(payload, "Citation needed", Some("Category:Living people")) {
+    Ok(result) => result
+    Err(err) => fail(err)
+  }
   assert_eq(titles, ["Page One"])
   assert_eq(
     contents.get("Page One"),
@@ -110,11 +152,17 @@ test "parse dump page matches applies category filter" {
 }
 
 ///|
-test "build dump page regex escapes template variants" {
-  assert_eq(
-    build_dump_page_regex("Template:Citation needed"),
-    "(?is)<page>.*?\\{\\{\\s*(?:subst:|safesubst:)?(?:template:)?\\s*citation[ _]+needed(?=[\\s|}]).*?</page>",
+test "parse dump page extracts title and revision text" {
+  let page = parse_dump_page(
+    "<page><title>Sample</title><revision><text>Body</text></revision></page>",
   )
+  match page {
+    Some(page) => {
+      assert_eq(page.title, "Sample")
+      assert_eq(page.content, "Body")
+    }
+    None => fail("expected parsed page")
+  }
 }
 
 ///|

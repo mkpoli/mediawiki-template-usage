@@ -10,7 +10,11 @@ pub fn command() -> @argparse.Command
 
 pub fn parse_config(Array[String]) -> Config raise CliError
 
+pub fn remove_file_for_test(String) -> Unit
+
 pub fn run_cli(Array[String]) -> Unit
+
+pub fn write_string_to_file_for_test(String, String) -> Unit
 
 // Errors
 pub(all) suberror CliError {
@@ -21,6 +25,7 @@ pub impl Show for CliError
 // Types and methods
 pub(all) struct Config {
   endpoint : String
+  dump_files : Array[String]
   template_name : String
   category_name : String?
   limit : Int?
