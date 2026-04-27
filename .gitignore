@@ -2,4 +2,6 @@
 _build/
 .mooncakes/
 .moonagent/
+.repos/
+.mediawiki_template_usage_*.xml
 .mediawiki_template_usage_*.json
