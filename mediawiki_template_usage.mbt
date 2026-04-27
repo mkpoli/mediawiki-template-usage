@@ -14,30 +14,12 @@ const CONTENT_BATCH_SIZE = 20
 const DUMP_READ_CHUNK_SIZE = 65536
 
 ///|
-pub(all) enum SortBy {
-  Api
-  TitleAsc
-  TitleDesc
-} derive(Eq)
-
-///|
-pub impl Show for SortBy with output(self, logger) {
-  let label = match self {
-    Api => "api"
-    TitleAsc => "title-asc"
-    TitleDesc => "title-desc"
-  }
-  logger.write_string(label)
-}
-
-///|
 pub(all) struct Config {
   endpoint : String
   dump_files : Array[String]
   template_name : String
   category_name : String?
   limit : Int?
-  sort_by : SortBy
   show_content : Bool
   verbose : Bool
 } derive(Eq)
@@ -54,8 +36,6 @@ pub impl Show for Config with output(self, logger) {
   logger.write_object(self.category_name)
   logger.write_string(", limit: ")
   logger.write_object(self.limit)
-  logger.write_string(", sort_by: ")
-  logger.write_object(self.sort_by)
   logger.write_string(", show_content: ")
   logger.write_object(self.show_content)
   logger.write_string(", verbose: ")
@@ -104,7 +84,7 @@ extern "c" fn lseek_ffi(fd : Int, offset : Int, whence : Int) -> Int = "lseek"
 extern "c" fn unlink_ffi(path : Bytes) -> Int = "unlink"
 
 ///|
-pub fn run_cli(args : Array[String]) -> Unit {
+pub async fn run_cli(args : Array[String]) -> Unit {
   try {
     let config = parse_config(args)
     debug_log(config.verbose, "config: " + config.to_string())
@@ -114,7 +94,6 @@ pub fn run_cli(args : Array[String]) -> Unit {
         config.dump_files,
         config.template_name,
         config.category_name,
-        config.sort_by,
         config.limit,
         config.verbose,
       ) {
@@ -158,12 +137,6 @@ pub fn command() -> @argparse.Command {
         short='l',
         about="Maximum number of page titles to print.",
         default_values=["10"],
-      ),
-      @argparse.OptionArg::new(
-        "sort-by",
-        short='s',
-        about="Sort order: api, title-asc, or title-desc. api preserves API or dump order.",
-        default_values=["api"],
       ),
       @argparse.OptionArg::new(
         "category",
@@ -215,10 +188,6 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
     _ => Some(10)
   }
-  let sort_by = match values.get("sort-by") {
-    Some([raw_sort, ..]) => parse_sort_by(raw_sort)
-    _ => Api
-  }
   let show_content = matches.flags.get_or_default("show-content", false)
   let verbose = matches.flags.get_or_default("verbose", false)
   {
@@ -227,7 +196,6 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     template_name,
     category_name,
     limit,
-    sort_by,
     show_content,
     verbose,
   }
@@ -459,16 +427,6 @@ fn parse_limit(raw_limit : String) -> Int raise CliError {
 }
 
 ///|
-fn parse_sort_by(raw_sort : String) -> SortBy raise CliError {
-  match raw_sort.trim() {
-    "api" => Api
-    "title-asc" => TitleAsc
-    "title-desc" => TitleDesc
-    _ => raise Message("sort-by must be one of: api, title-asc, title-desc")
-  }
-}
-
-///|
 fn extract_cli_args(args : Array[String]) -> Array[String] {
   let mut separator_index = -1
   for i = 0; i < args.length(); i = i + 1 {
@@ -508,12 +466,11 @@ fn normalize_cli_args(args : Array[String]) -> Array[String] {
 }
 
 ///|
-fn fetch_all_template_usages(
+async fn fetch_all_template_usages(
   endpoint : String,
   dump_files : Array[String],
   template_name : String,
   category_name : String?,
-  sort_by : SortBy,
   limit : Int?,
   verbose : Bool,
 ) -> Result[UsageResults, String] {
@@ -529,17 +486,12 @@ fn fetch_all_template_usages(
   if dump_files.length() > 0 {
     let results = match
       fetch_dump_template_usages(
-        dump_files,
-        template_name,
-        category_name,
-        dump_scan_limit(sort_by, limit),
-        verbose,
+        dump_files, template_name, category_name, verbose,
       ) {
       Ok(results) => results
       Err(message) => return Err(message)
     }
-    let sorted = sort_titles(results.titles, sort_by)
-    let limited = limit_titles(sorted, limit)
+    let limited = limit_titles(results.titles, limit)
     let limit_suffix = match limit {
       Some(value) => ", limit=" + value.to_string()
       None => ", no limit"
@@ -550,8 +502,6 @@ fn fetch_all_template_usages(
       results.titles.length().to_string() +
       " dump titles before limit; returning " +
       limited.length().to_string() +
-      " after sort=" +
-      sort_by.to_string() +
       limit_suffix,
     )
     return Ok({ titles: limited, page_contents: results.page_contents })
@@ -568,8 +518,7 @@ fn fetch_all_template_usages(
     Ok(titles) => titles
     Err(message) => return Err(message)
   }
-  let sorted = sort_titles(titles, sort_by)
-  let limited = limit_titles(sorted, limit)
+  let limited = limit_titles(titles, limit)
   let limit_suffix = match limit {
     Some(value) => ", limit=" + value.to_string()
     None => ", no limit"
@@ -580,19 +529,16 @@ fn fetch_all_template_usages(
     titles.length().to_string() +
     " titles before limit; returning " +
     limited.length().to_string() +
-    " after sort=" +
-    sort_by.to_string() +
     limit_suffix,
   )
   Ok({ titles: limited, page_contents: None })
 }
 
 ///|
-fn fetch_dump_template_usages(
+async fn fetch_dump_template_usages(
   dump_files : Array[String],
   template_name : String,
   category_name : String?,
-  stop_after : Int?,
   verbose : Bool,
 ) -> Result[UsageResults, String] {
   debug_log(
@@ -602,9 +548,7 @@ fn fetch_dump_template_usages(
     " dump file(s) for template matches",
   )
   let (titles, page_contents) = match
-    collect_dump_template_usages(
-      dump_files, template_name, category_name, stop_after,
-    ) {
+    collect_dump_template_usages(dump_files, template_name, category_name) {
     Ok(parsed) => parsed
     Err(message) => return Err(message)
   }
@@ -616,85 +560,89 @@ fn fetch_dump_template_usages(
 }
 
 ///|
-fn collect_dump_template_usages(
+async fn collect_dump_template_usages(
   dump_files : Array[String],
   template_name : String,
   category_name : String?,
-  stop_after : Int?,
 ) -> Result[(Array[String], Map[String, String]), String] {
-  let titles = []
-  let page_contents = {}
-  for dump_file in dump_files {
-    let scan_result = scan_dump_file(
-      dump_file, template_name, category_name, titles, page_contents, stop_after,
-    )
-    match scan_result {
-      Ok(_) => ()
+  let titles : Array[String] = []
+  let page_contents : Map[String, String] = {}
+  let parsed = @async.with_task_group(group => {
+    let tasks = []
+    for dump_file in dump_files {
+      tasks.push(
+        group.spawn(() => {
+          scan_dump_file(dump_file, template_name, category_name)
+        }),
+      )
+    }
+    let results = []
+    for task in tasks {
+      results.push(task.wait())
+    }
+    results
+  }) catch {
+    err => return Err(err.to_string())
+  }
+  for result in parsed {
+    let (file_titles, file_contents) = match result {
+      Ok(value) => value
       Err(message) => return Err(message)
     }
-    if reached_dump_scan_limit(titles.length(), stop_after) {
+    append_titles(titles, file_titles)
+    merge_page_contents(page_contents, file_contents)
+  }
+  Ok((titles, page_contents))
+}
+
+///|
+fn merge_page_contents(
+  target : Map[String, String],
+  source : Map[String, String],
+) -> Unit {
+  for entry in source.iter() {
+    target[entry.0] = entry.1
+  }
+}
+
+///|
+async fn scan_dump_file(
+  dump_file : String,
+  template_name : String,
+  category_name : String?,
+) -> Result[(Array[String], Map[String, String]), String] {
+  let file = @async_fs.open(dump_file, mode=@async_fs.ReadOnly) catch {
+    _ => return Err("failed to open dump file")
+  }
+  defer file.close()
+  let titles : Array[String] = []
+  let page_contents : Map[String, String] = {}
+  let pending : Array[Byte] = []
+  let buffer = FixedArray::make(DUMP_READ_CHUNK_SIZE, b'\x00')
+  let mut chunks = 0
+  while true {
+    let bytes_read = file.read(buffer) catch {
+      _ => return Err("failed to read dump file")
+    }
+    if bytes_read == 0 {
       break
+    }
+    chunks += 1
+    append_bytes_from_buffer(pending, buffer, bytes_read)
+    process_pending_dump_pages(
+      pending, template_name, category_name, titles, page_contents,
+    )
+    if chunks % 8 == 0 {
+      @async.pause()
     }
   }
   Ok((titles, page_contents))
 }
 
 ///|
-fn dump_scan_limit(sort_by : SortBy, limit : Int?) -> Int? {
-  match sort_by {
-    Api => limit
-    _ => None
-  }
-}
-
-///|
-fn reached_dump_scan_limit(count : Int, stop_after : Int?) -> Bool {
-  match stop_after {
-    Some(limit) => count >= limit
-    None => false
-  }
-}
-
-///|
-fn scan_dump_file(
-  dump_file : String,
-  template_name : String,
-  category_name : String?,
-  titles : Array[String],
-  page_contents : Map[String, String],
-  stop_after : Int?,
-) -> Result[Unit, String] {
-  let fd = open_ffi(string_to_utf8_bytes(dump_file, true), O_RDONLY, 0)
-  if fd < 0 {
-    return Err("failed to open dump file")
-  }
-  let buffer = Bytes::new(DUMP_READ_CHUNK_SIZE)
-  let pending : Array[Byte] = []
-  while true {
-    let bytes_read = read_ffi(fd, buffer, DUMP_READ_CHUNK_SIZE)
-    if bytes_read < 0 {
-      ignore(close_ffi(fd))
-      return Err("failed to read dump file")
-    }
-    if bytes_read == 0 {
-      break
-    }
-    append_bytes_from_buffer(pending, buffer, bytes_read)
-    process_pending_dump_pages(
-      pending, template_name, category_name, titles, page_contents, stop_after,
-    )
-    if reached_dump_scan_limit(titles.length(), stop_after) {
-      break
-    }
-  }
-  ignore(close_ffi(fd))
-  Ok(())
-}
-
-///|
 fn append_bytes_from_buffer(
   pending : Array[Byte],
-  buffer : Bytes,
+  buffer : FixedArray[Byte],
   bytes_read : Int,
 ) -> Unit {
   for i = 0; i < bytes_read; i = i + 1 {
@@ -709,7 +657,6 @@ fn process_pending_dump_pages(
   category_name : String?,
   titles : Array[String],
   page_contents : Map[String, String],
-  stop_after : Int?,
 ) -> Unit {
   let page_start = string_to_utf8_bytes("<page", false).to_array()
   let page_end = string_to_utf8_bytes("</page>", false).to_array()
@@ -733,9 +680,6 @@ fn process_pending_dump_pages(
       page_xml, template_name, category_name, titles, page_contents,
     )
     drop_pending_prefix(pending, end + page_end.length())
-    if reached_dump_scan_limit(titles.length(), stop_after) {
-      break
-    }
   }
 }
 
@@ -1114,70 +1058,10 @@ fn fetch_all_template_usage_titles(
 }
 
 ///|
-fn sort_titles(titles : Array[String], sort_by : SortBy) -> Array[String] {
-  if sort_by is Api {
-    return titles.copy()
-  }
-  if titles.length() <= 1 {
-    return titles.copy()
-  }
-  let pivot = titles[titles.length() / 2]
-  let less = []
-  let equal = []
-  let greater = []
-  for title in titles {
-    let order = compare_titles_for_sort(title, pivot, sort_by)
-    if order < 0 {
-      less.push(title)
-    } else if order > 0 {
-      greater.push(title)
-    } else {
-      equal.push(title)
-    }
-  }
-  concat_titles(
-    sort_titles(less, sort_by),
-    equal,
-    sort_titles(greater, sort_by),
-  )
-}
-
-///|
-fn concat_titles(
-  left : Array[String],
-  middle : Array[String],
-  right : Array[String],
-) -> Array[String] {
-  let merged = []
-  append_titles(merged, left)
-  append_titles(merged, middle)
-  append_titles(merged, right)
-  merged
-}
-
-///|
 fn append_titles(target : Array[String], source : Array[String]) -> Unit {
   for title in source {
     target.push(title)
   }
-}
-
-///|
-fn compare_titles_for_sort(
-  left : String,
-  right : String,
-  sort_by : SortBy,
-) -> Int {
-  match sort_by {
-    Api => 0
-    TitleAsc => compare_titles(left, right)
-    TitleDesc => compare_titles(right, left)
-  }
-}
-
-///|
-fn compare_titles(left : String, right : String) -> Int {
-  left.lexical_compare(right)
 }
 
 ///|

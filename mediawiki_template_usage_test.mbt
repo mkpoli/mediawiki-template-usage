@@ -2,8 +2,7 @@
 test "parse config accepts explicit limit" {
   let config = @mediawiki_template_usage.parse_config([
     "/tmp/mediawiki-template-usage", "https://en.wikipedia.org/w/api.php", "Citation needed",
-    "--limit", "3", "--sort-by", "title-asc", "--show-content", "--category", "Living people",
-    "-v",
+    "--limit", "3", "--show-content", "--category", "Living people", "-v",
   ]) catch {
     err => fail("parse_config failed: \{err}")
   }
@@ -12,7 +11,6 @@ test "parse config accepts explicit limit" {
   assert_eq(config.template_name, "Citation needed")
   assert_eq(config.category_name, Some("Category:Living people"))
   assert_eq(config.limit, Some(3))
-  assert_eq(config.sort_by, @mediawiki_template_usage.TitleAsc)
   assert_eq(config.show_content, true)
   assert_eq(config.verbose, true)
 }
@@ -34,7 +32,6 @@ test "parse config accepts dump file source" {
   assert_eq(config.dump_files, [dump_file])
   assert_eq(config.template_name, "Citation needed")
   assert_eq(config.limit, Some(10))
-  assert_eq(config.sort_by, @mediawiki_template_usage.Api)
   assert_eq(config.show_content, false)
 }
 
@@ -76,7 +73,6 @@ test "parse config resolves endpoint aliases" {
   assert_eq(config.template_name, "Citation needed")
   assert_eq(config.category_name, None)
   assert_eq(config.limit, Some(10))
-  assert_eq(config.sort_by, @mediawiki_template_usage.Api)
   assert_eq(config.show_content, false)
   assert_eq(config.verbose, false)
 }
@@ -92,7 +88,6 @@ test "parse config resolves shared project aliases" {
   assert_eq(config.dump_files, [])
   assert_eq(config.category_name, None)
   assert_eq(config.limit, Some(10))
-  assert_eq(config.sort_by, @mediawiki_template_usage.Api)
   assert_eq(config.show_content, false)
   assert_eq(config.verbose, false)
 }
@@ -110,7 +105,6 @@ test "parse config prefers args after separator" {
   assert_eq(config.template_name, "Main page")
   assert_eq(config.category_name, None)
   assert_eq(config.limit, Some(2))
-  assert_eq(config.sort_by, @mediawiki_template_usage.Api)
   assert_eq(config.show_content, false)
   assert_eq(config.verbose, false)
 }
@@ -146,7 +140,6 @@ test "render help mentions limit and template" {
   assert_true(help.contains("--limit"))
   assert_true(help.contains("-l, --limit"))
   assert_true(help.contains("[default: 10]"))
-  assert_true(help.contains("--sort-by"))
   assert_true(help.contains("--category"))
   assert_true(help.contains("-v, --verbose"))
   assert_true(help.contains("--verbose"))

@@ -12,7 +12,7 @@ pub fn parse_config(Array[String]) -> Config raise CliError
 
 pub fn remove_file_for_test(String) -> Unit
 
-pub fn run_cli(Array[String]) -> Unit
+pub async fn run_cli(Array[String]) -> Unit
 
 pub fn write_string_to_file_for_test(String, String) -> Unit
 
@@ -29,18 +29,10 @@ pub(all) struct Config {
   template_name : String
   category_name : String?
   limit : Int?
-  sort_by : SortBy
   show_content : Bool
   verbose : Bool
 } derive(Eq)
 pub impl Show for Config
-
-pub(all) enum SortBy {
-  Api
-  TitleAsc
-  TitleDesc
-} derive(Eq)
-pub impl Show for SortBy
 
 // Type aliases
 

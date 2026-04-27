@@ -166,19 +166,6 @@ test "parse dump page extracts title and revision text" {
 }
 
 ///|
-test "sort titles by title desc" {
-  assert_eq(sort_titles(["Short", "Long", "Medium"], TitleDesc), [
-    "Short", "Medium", "Long",
-  ])
-}
-
-///|
-test "sort titles preserves api order" {
-  let titles = ["B", "A", "C"]
-  assert_eq(sort_titles(titles, Api), ["B", "A", "C"])
-}
-
-///|
 test "extract page content response" {
   let payload =
     #|{

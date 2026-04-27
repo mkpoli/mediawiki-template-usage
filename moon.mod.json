@@ -2,7 +2,8 @@
   "name": "username/mediawiki_template_usage",
   "version": "0.1.2",
   "deps": {
-    "moonbitlang/x": "0.4.43"
+    "moonbitlang/x": "0.4.43",
+    "moonbitlang/async": "0.18.1"
   },
   "readme": "README.mbt.md",
   "repository": "",
