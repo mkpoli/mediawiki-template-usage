@@ -28,6 +28,7 @@ pub(all) struct Config {
   dump_files : Array[String]
   template_name : String
   category_name : String?
+  param_filters : Array[TemplateParamFilter]
   limit : Int?
   sort_by : SortBy
   show_content : Bool
@@ -41,6 +42,18 @@ pub(all) enum SortBy {
   TitleDesc
 } derive(Eq)
 pub impl Show for SortBy
+
+pub(all) struct TemplateParamFilter {
+  key : TemplateParamKey
+  value : String
+} derive(Eq)
+pub impl Show for TemplateParamFilter
+
+pub(all) enum TemplateParamKey {
+  Positional(Int)
+  Named(String)
+} derive(Eq)
+pub impl Show for TemplateParamKey
 
 // Type aliases
 

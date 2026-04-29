@@ -39,6 +39,7 @@ pub(all) struct Config {
   dump_files : Array[String]
   template_name : String
   category_name : String?
+  param_filters : Array[TemplateParamFilter]
   limit : Int?
   sort_by : SortBy
   show_content : Bool
@@ -55,6 +56,8 @@ pub impl Show for Config with output(self, logger) {
   logger.write_object(self.template_name)
   logger.write_string(", category_name: ")
   logger.write_object(self.category_name)
+  logger.write_string(", param_filters: ")
+  logger.write_object(render_param_filters(self.param_filters))
   logger.write_string(", limit: ")
   logger.write_object(self.limit)
   logger.write_string(", sort_by: ")
@@ -92,6 +95,44 @@ priv struct QueryContext {
   template_target : String
   category_title : String?
   category_target : String?
+  param_filters : Array[TemplateParamFilter]
+}
+
+///|
+pub(all) enum TemplateParamKey {
+  Positional(Int)
+  Named(String)
+} derive(Eq)
+
+///|
+pub(all) struct TemplateParamFilter {
+  key : TemplateParamKey
+  value : String
+} derive(Eq)
+
+///|
+pub impl Show for TemplateParamKey with output(self, logger) {
+  match self {
+    Positional(index) => {
+      logger.write_string("Positional(")
+      logger.write_object(index)
+      logger.write_string(")")
+    }
+    Named(name) => {
+      logger.write_string("Named(")
+      logger.write_object(name)
+      logger.write_string(")")
+    }
+  }
+}
+
+///|
+pub impl Show for TemplateParamFilter with output(self, logger) {
+  logger.write_string("TemplateParamFilter::{ key: ")
+  logger.write_object(self.key)
+  logger.write_string(", value: ")
+  logger.write_object(self.value)
+  logger.write_string(" }")
 }
 
 ///|
@@ -133,12 +174,17 @@ pub async fn run_cli(args : Array[String]) -> Unit {
   try {
     let config = parse_config(args)
     debug_log(config.verbose, "config: " + config.to_string())
+    maybe_warn_dump_category_limitations(
+      config.dump_files,
+      config.category_name,
+    )
     match
       fetch_all_template_usages(
         config.endpoint,
         config.dump_files,
         config.template_name,
         config.category_name,
+        config.param_filters,
         config.sort_by,
         config.limit,
         config.verbose,
@@ -146,7 +192,7 @@ pub async fn run_cli(args : Array[String]) -> Unit {
       Ok(results) =>
         output_results(
           config.endpoint,
-          results.query.template_target,
+          results.query,
           results.titles,
           results.page_contents,
           config.show_content,
@@ -163,7 +209,7 @@ pub async fn run_cli(args : Array[String]) -> Unit {
 pub fn command() -> @argparse.Command {
   @argparse.Command::new(
     "mediawiki-template-usage",
-    about="List pages that transclude a MediaWiki template from a MediaWiki API or local Wikimedia XML dump files.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Production (dump file): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\"\n  Production (multiple dump files): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\" --dump-file jawiktionary-2026-04-01-p7p579549.xml\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
+    about="List pages that transclude a MediaWiki template from a MediaWiki API or local Wikimedia XML dump files.\n\nExamples:\n  Production: ./mediawiki-template-usage enwp \"Citation needed\"\n  Production with category filter: ./mediawiki-template-usage enwp \"Citation needed\" --category \"Living people\"\n  Production with parameter filter: ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml affix --param \"1=ain\"\n  Production (dump file): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\"\n  Production (multiple dump files): ./mediawiki-template-usage jawiktionary-2026-04-01-p7p579548.xml \"Citation needed\" --dump-file jawiktionary-2026-04-01-p7p579549.xml\n  Development: moon run cmd/main -- enwp \"Citation needed\"",
     version="0.1.2",
     arg_required_else_help=true,
     flags=[
@@ -193,7 +239,12 @@ pub fn command() -> @argparse.Command {
       @argparse.OptionArg::new(
         "category",
         short='c',
-        about="Only include pages that are in the given category, with or without the source wiki's category prefix.",
+        about="Only include pages that are in the given category, with or without the source wiki's category prefix. In dump mode this only checks explicit category links in page wikitext; categories generated through template expansion are not available from page XML dumps.",
+      ),
+      @argparse.OptionArg::new(
+        "param",
+        about="Only include template usages whose parameter matches KEY=VALUE. Repeat to require multiple parameters. Positional keys are 1-based, for example --param \"1=ain\".",
+        action=@argparse.Append,
       ),
       @argparse.OptionArg::new(
         "dump-file",
@@ -236,6 +287,7 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     Some([raw_category, ..]) => Some(raw_category.trim().to_string())
     _ => None
   }
+  let param_filters = parse_param_filters(values.get("param").unwrap_or([]))
   let limit = match values.get("limit") {
     Some([raw_limit, ..]) => Some(parse_limit(raw_limit))
     _ => Some(10)
@@ -251,10 +303,88 @@ pub fn parse_config(args : Array[String]) -> Config raise CliError {
     dump_files,
     template_name,
     category_name,
+    param_filters,
     limit,
     sort_by,
     show_content,
     verbose,
+  }
+}
+
+///|
+fn render_param_filters(filters : Array[TemplateParamFilter]) -> Array[String] {
+  let rendered = []
+  for filter in filters {
+    rendered.push(render_param_filter(filter))
+  }
+  rendered
+}
+
+///|
+fn render_param_filter(filter : TemplateParamFilter) -> String {
+  let key = match filter.key {
+    Positional(index) => index.to_string()
+    Named(name) => name
+  }
+  key + "=" + filter.value
+}
+
+///|
+fn parse_param_filters(
+  raw_param_filters : Array[String],
+) -> Array[TemplateParamFilter] raise CliError {
+  let filters = []
+  for raw_filter in raw_param_filters {
+    filters.push(parse_param_filter(raw_filter))
+  }
+  filters
+}
+
+///|
+fn parse_param_filter(
+  raw_filter : String,
+) -> TemplateParamFilter raise CliError {
+  let filter = raw_filter.trim().to_string()
+  let separator = find_substring(filter, "=", 0)
+  if separator <= 0 || separator >= filter.length() - 1 {
+    raise Message("--param must use KEY=VALUE, for example --param \"1=ain\"")
+  }
+  let raw_key = filter[:separator].to_string().trim().to_string()
+  let value = filter[separator + 1:].to_string().trim().to_string()
+  if raw_key.is_empty() || value.is_empty() {
+    raise Message("--param must use KEY=VALUE, for example --param \"1=ain\"")
+  }
+  { key: parse_param_key(raw_key), value }
+}
+
+///|
+fn parse_param_key(raw_key : String) -> TemplateParamKey raise CliError {
+  let parsed : Result[Int, _] = try? @string.parse_int(raw_key)
+  match parsed {
+    Ok(index) => {
+      if index <= 0 {
+        raise Message("--param positional indexes must be greater than 0")
+      }
+      Positional(index)
+    }
+    Err(_) => Named(raw_key.to_lower())
+  }
+}
+
+///|
+fn maybe_warn_dump_category_limitations(
+  dump_files : Array[String],
+  category_name : String?,
+) -> Unit {
+  if dump_files.length() == 0 {
+    return
+  }
+  match category_name {
+    Some(_) =>
+      println(
+        "warning: dump category filtering only checks explicit category links in page wikitext; categories generated through template expansion are not available from page XML dumps",
+      )
+    None => ()
   }
 }
 
@@ -275,7 +405,7 @@ pub fn remove_file_for_test(path : String) -> Unit {
 ///|
 fn output_results(
   endpoint : String,
-  template_target : String,
+  query : QueryContext,
   titles : Array[String],
   page_contents : Map[String, String]?,
   show_content : Bool,
@@ -295,7 +425,7 @@ fn output_results(
   match page_contents {
     Some(contents) => {
       debug_log(verbose, "using page contents extracted from dump matches")
-      print_page_contents(titles, template_target, contents)
+      print_page_contents(titles, query, contents)
     }
     None => {
       debug_log(
@@ -303,7 +433,7 @@ fn output_results(
         "fetching page contents in batches of " + CONTENT_BATCH_SIZE.to_string(),
       )
       match fetch_page_contents(endpoint, titles) {
-        Ok(contents) => print_page_contents(titles, template_target, contents)
+        Ok(contents) => print_page_contents(titles, query, contents)
         Err(message) => println("error: \{message}")
       }
     }
@@ -538,6 +668,7 @@ async fn fetch_all_template_usages(
   dump_files : Array[String],
   template_name : String,
   category_name : String?,
+  param_filters : Array[TemplateParamFilter],
   sort_by : SortBy,
   limit : Int?,
   verbose : Bool,
@@ -546,7 +677,9 @@ async fn fetch_all_template_usages(
     Ok(namespaces) => namespaces
     Err(message) => return Err(message)
   }
-  let query = build_query_context(template_name, category_name, namespaces)
+  let query = build_query_context(
+    template_name, category_name, param_filters, namespaces,
+  )
   let category_suffix = match query.category_title {
     Some(category) => " in " + category
     None => " without category filter"
@@ -588,6 +721,35 @@ async fn fetch_all_template_usages(
     fetch_all_template_usage_titles(endpoint, query, None, [], verbose) {
     Ok(titles) => titles
     Err(message) => return Err(message)
+  }
+  if query_requires_content_scan(query) {
+    debug_log(
+      verbose, "fetching page contents to apply template parameter filters",
+    )
+    let contents = match fetch_page_contents(endpoint, titles) {
+      Ok(contents) => contents
+      Err(message) => return Err(message)
+    }
+    let (filtered_titles, filtered_contents) = filter_titles_by_query(
+      titles, contents, query,
+    )
+    let sorted = sort_titles(filtered_titles, sort_by)
+    let limited = limit_titles(sorted, limit)
+    let limit_suffix = match limit {
+      Some(value) => ", limit=" + value.to_string()
+      None => ", no limit"
+    }
+    debug_log(
+      verbose,
+      "collected " +
+      filtered_titles.length().to_string() +
+      " titles after parameter filtering; returning " +
+      limited.length().to_string() +
+      " after sort=" +
+      sort_by.to_string() +
+      limit_suffix,
+    )
+    return Ok({ titles: limited, page_contents: Some(filtered_contents), query })
   }
   let sorted = sort_titles(titles, sort_by)
   let limited = limit_titles(sorted, limit)
@@ -842,7 +1004,11 @@ fn process_dump_page_xml(
     Some(page) => page
     None => return
   }
-  if !page_contains_template(page.content, query.template_target) {
+  if !page_contains_template(
+      page.content,
+      query.template_target,
+      query.param_filters,
+    ) {
     return
   }
   if !dump_page_matches_category(page.content, query.category_target) {
@@ -1076,8 +1242,12 @@ fn decode_xml_entities(text : String) -> String {
 }
 
 ///|
-fn page_contains_template(content : String, template_target : String) -> Bool {
-  extract_template_usages(content, template_target).length() > 0
+fn page_contains_template(
+  content : String,
+  template_target : String,
+  param_filters : Array[TemplateParamFilter],
+) -> Bool {
+  extract_template_usages(content, template_target, param_filters).length() > 0
 }
 
 ///|
@@ -1419,14 +1589,15 @@ fn extract_page_revision_content(page_obj : Map[String, Json]) -> String {
 ///|
 fn print_page_contents(
   titles : Array[String],
-  template_name : String,
+  query : QueryContext,
   contents : Map[String, String],
 ) -> Unit {
   let mut first = true
   for title in titles {
     let snippets = extract_template_usages(
       contents.get_or_default(title, ""),
-      template_name,
+      query.template_target,
+      query.param_filters,
     )
     if snippets.length() == 0 {
       continue
@@ -1448,6 +1619,7 @@ fn render_page_content(title : String, snippets : Array[String]) -> String {
 fn extract_template_usages(
   content : String,
   template_target : String,
+  param_filters : Array[TemplateParamFilter],
 ) -> Array[String] {
   let snippets = []
   let len = content.length()
@@ -1457,8 +1629,7 @@ fn extract_template_usages(
       let end = find_transclusion_end(content, i)
       if end > i {
         let snippet = content[i:end].to_string()
-        if normalize_namespace_target(extract_transclusion_target(snippet)) ==
-          template_target {
+        if transclusion_matches_query(snippet, template_target, param_filters) {
           snippets.push(snippet)
         }
         i = end
@@ -1472,12 +1643,196 @@ fn extract_template_usages(
 
 ///|
 fn extract_transclusion_target(snippet : String) -> String {
-  if snippet.length() < 4 {
+  let parts = split_transclusion_parts(snippet)
+  if parts.length() == 0 {
     return ""
   }
-  let body = snippet[2:snippet.length() - 2].to_string().trim().to_string()
-  let head = body.split("|").to_array()[0].trim().to_string()
+  let head = parts[0].trim().to_string()
   strip_transclusion_prefixes(head)
+}
+
+///|
+fn transclusion_matches_query(
+  snippet : String,
+  template_target : String,
+  param_filters : Array[TemplateParamFilter],
+) -> Bool {
+  if normalize_namespace_target(extract_transclusion_target(snippet)) !=
+    template_target {
+    return false
+  }
+  transclusion_matches_param_filters(snippet, param_filters)
+}
+
+///|
+fn transclusion_matches_param_filters(
+  snippet : String,
+  param_filters : Array[TemplateParamFilter],
+) -> Bool {
+  if param_filters.length() == 0 {
+    return true
+  }
+  let params = extract_transclusion_parameters(snippet)
+  for filter in param_filters {
+    if !transclusion_has_matching_param(params, filter) {
+      return false
+    }
+  }
+  true
+}
+
+///|
+fn extract_transclusion_parameters(snippet : String) -> Array[String] {
+  let parts = split_transclusion_parts(snippet)
+  let params = []
+  for i = 1; i < parts.length(); i = i + 1 {
+    params.push(parts[i])
+  }
+  params
+}
+
+///|
+fn transclusion_has_matching_param(
+  params : Array[String],
+  filter : TemplateParamFilter,
+) -> Bool {
+  let mut positional_index = 0
+  for param in params {
+    match split_top_level_assignment(param) {
+      Some((name, value)) =>
+        match filter.key {
+          Named(expected_name) =>
+            if name.to_lower() == expected_name && value == filter.value {
+              return true
+            }
+          _ => ()
+        }
+      None => {
+        positional_index += 1
+        match filter.key {
+          Positional(expected_index) =>
+            if positional_index == expected_index && param == filter.value {
+              return true
+            }
+          _ => ()
+        }
+      }
+    }
+  }
+  false
+}
+
+///|
+fn split_transclusion_parts(snippet : String) -> Array[String] {
+  if snippet.length() < 4 {
+    return []
+  }
+  split_top_level_segments(snippet[2:snippet.length() - 2].to_string(), '|')
+}
+
+///|
+fn split_top_level_assignment(param : String) -> (String, String)? {
+  let separator = find_top_level_delimiter(param, '=')
+  if separator < 0 {
+    return None
+  }
+  Some(
+    (
+      param[:separator].to_string().trim().to_string(),
+      param[separator + 1:].to_string().trim().to_string(),
+    ),
+  )
+}
+
+///|
+fn split_top_level_segments(
+  content : String,
+  delimiter : Char,
+) -> Array[String] {
+  let segments = []
+  let len = content.length()
+  let delimiter_code = delimiter.to_int()
+  let mut brace_depth = 0
+  let mut bracket_depth = 0
+  let mut start = 0
+  let mut i = 0
+  while i < len {
+    if i + 1 < len && is_double_open_brace(content, i) {
+      brace_depth += 1
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_close_brace(content, i) {
+      if brace_depth > 0 {
+        brace_depth -= 1
+      }
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_open_bracket(content, i) {
+      bracket_depth += 1
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_close_bracket(content, i) {
+      if bracket_depth > 0 {
+        bracket_depth -= 1
+      }
+      i += 2
+      continue
+    }
+    if content.code_unit_at(i).to_int() == delimiter_code &&
+      brace_depth == 0 &&
+      bracket_depth == 0 {
+      segments.push(content[start:i].to_string().trim().to_string())
+      start = i + 1
+    }
+    i += 1
+  }
+  segments.push(content[start:len].to_string().trim().to_string())
+  segments
+}
+
+///|
+fn find_top_level_delimiter(content : String, delimiter : Char) -> Int {
+  let len = content.length()
+  let delimiter_code = delimiter.to_int()
+  let mut brace_depth = 0
+  let mut bracket_depth = 0
+  let mut i = 0
+  while i < len {
+    if i + 1 < len && is_double_open_brace(content, i) {
+      brace_depth += 1
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_close_brace(content, i) {
+      if brace_depth > 0 {
+        brace_depth -= 1
+      }
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_open_bracket(content, i) {
+      bracket_depth += 1
+      i += 2
+      continue
+    }
+    if i + 1 < len && is_double_close_bracket(content, i) {
+      if bracket_depth > 0 {
+        bracket_depth -= 1
+      }
+      i += 2
+      continue
+    }
+    if content.code_unit_at(i).to_int() == delimiter_code &&
+      brace_depth == 0 &&
+      bracket_depth == 0 {
+      return i
+    }
+    i += 1
+  }
+  -1
 }
 
 ///|
@@ -1833,6 +2188,7 @@ fn load_source_namespaces(
 fn build_query_context(
   raw_template_name : String,
   raw_category_name : String?,
+  param_filters : Array[TemplateParamFilter],
   namespaces : SourceNamespaces,
 ) -> QueryContext {
   let template_title = normalize_namespace_title(
@@ -1853,7 +2209,35 @@ fn build_query_context(
     template_target: normalize_namespace_target(template_title),
     category_title,
     category_target,
+    param_filters,
   }
+}
+
+///|
+fn query_requires_content_scan(query : QueryContext) -> Bool {
+  query.param_filters.length() > 0
+}
+
+///|
+fn filter_titles_by_query(
+  titles : Array[String],
+  page_contents : Map[String, String],
+  query : QueryContext,
+) -> (Array[String], Map[String, String]) {
+  let filtered_titles = []
+  let filtered_contents = {}
+  for title in titles {
+    let content = page_contents.get_or_default(title, "")
+    if page_contains_template(
+        content,
+        query.template_target,
+        query.param_filters,
+      ) {
+      filtered_titles.push(title)
+      filtered_contents[title] = content
+    }
+  }
+  (filtered_titles, filtered_contents)
 }
 
 ///|

@@ -10,9 +10,24 @@ test "parse config accepts explicit limit" {
   assert_eq(config.dump_files, [])
   assert_eq(config.template_name, "Citation needed")
   assert_eq(config.category_name, Some("Living people"))
+  assert_eq(config.param_filters, [])
   assert_eq(config.limit, Some(3))
   assert_eq(config.show_content, true)
   assert_eq(config.verbose, true)
+}
+
+///|
+test "parse config accepts template parameter filters" {
+  let config = @mediawiki_template_usage.parse_config([
+    "/tmp/mediawiki-template-usage", "enwp", "affix", "--param", "1=ain", "--param",
+    "t1=三つの",
+  ]) catch {
+    err => fail("parse_config failed: \{err}")
+  }
+  assert_eq(config.param_filters, [
+    { key: @mediawiki_template_usage.Positional(1), value: "ain" },
+    { key: @mediawiki_template_usage.Named("t1"), value: "三つの" },
+  ])
 }
 
 ///|
@@ -141,6 +156,7 @@ test "render help mentions limit and template" {
   assert_true(help.contains("-l, --limit"))
   assert_true(help.contains("[default: 10]"))
   assert_true(help.contains("--category"))
+  assert_true(help.contains("--param"))
   assert_true(help.contains("-v, --verbose"))
   assert_true(help.contains("--verbose"))
   assert_true(help.contains("--show-content"))
@@ -153,5 +169,7 @@ test "render help mentions limit and template" {
   )
   assert_true(help.contains("jawiktionary-2026-04-01-p7p579548.xml"))
   assert_true(help.contains("--category \"Living people\""))
+  assert_true(help.contains("--param \"1=ain\""))
+  assert_true(help.contains("page XML dumps"))
   assert_true(help.contains("moon run cmd/main -- enwp \"Citation needed\""))
 }

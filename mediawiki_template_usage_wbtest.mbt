@@ -111,7 +111,7 @@ test "split dump pages extracts page fragments" {
 
 ///|
 test "parse dump xml extracts titles and content" {
-  let query = build_query_context("Citation needed", None, {
+  let query = build_query_context("Citation needed", None, [], {
     template: {
       primary_name: "Template",
       canonical_name: Some("Template"),
@@ -151,6 +151,7 @@ test "parse dump xml applies category filter" {
   let query = build_query_context(
     "Citation needed",
     Some("カテゴリ:Living people"),
+    [],
     {
       template: {
         primary_name: "Template",
@@ -237,7 +238,7 @@ test "extract page content response" {
 ///|
 test "extract template usages finds matching snippets" {
   let content = "Before\n{{Infobox scientist|name=Albert Einstein}}\nMiddle\n{{Citation needed|date=April 2024}}\nAfter"
-  assert_eq(extract_template_usages(content, "citation needed"), [
+  assert_eq(extract_template_usages(content, "citation needed", []), [
     "{{Citation needed|date=April 2024}}",
   ])
 }
@@ -245,9 +246,31 @@ test "extract template usages finds matching snippets" {
 ///|
 test "extract template usages handles nested templates" {
   let content = "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}"
-  assert_eq(extract_template_usages(content, "citation needed"), [
+  assert_eq(extract_template_usages(content, "citation needed", []), [
     "{{Citation needed|reason={{lang|fr|source needed}}|date=April 2024}}",
   ])
+}
+
+///|
+test "extract template usages applies positional parameter filters" {
+  let content = "{{affix|ko|^아이누|t1=[[アイヌ]]|-어|t2=[[語]]}}\n{{affix|ain|re|t1=三つの|-p|t2=もの}}"
+  assert_eq(
+    extract_template_usages(content, "affix", [
+      { key: Positional(1), value: "ain" },
+    ]),
+    ["{{affix|ain|re|t1=三つの|-p|t2=もの}}"],
+  )
+}
+
+///|
+test "extract template usages applies named parameter filters" {
+  let content = "{{affix|ain|re|t1=三つの|-p|t2=もの}}\n{{affix|ain|re|t1=別の|-p|t2=もの}}"
+  assert_eq(
+    extract_template_usages(content, "affix", [
+      { key: Named("t1"), value: "三つの" },
+    ]),
+    ["{{affix|ain|re|t1=三つの|-p|t2=もの}}"],
+  )
 }
 
 ///|
@@ -286,6 +309,7 @@ test "build query context uses localized aliases" {
   let query = build_query_context(
     "テンプレート:Citation needed",
     Some("カテゴリ:アイヌ語"),
+    [{ key: Positional(1), value: "ain" }],
     {
       template: {
         primary_name: "Template",
@@ -303,6 +327,7 @@ test "build query context uses localized aliases" {
   assert_eq(query.template_target, "citation needed")
   assert_eq(query.category_title, Some("Category:アイヌ語"))
   assert_eq(query.category_target, Some("アイヌ語"))
+  assert_eq(query.param_filters, [{ key: Positional(1), value: "ain" }])
 }
 
 ///|
